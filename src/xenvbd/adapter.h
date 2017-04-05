@@ -29,14 +29,14 @@
  * SUCH DAMAGE.
  */ 
 
-#ifndef _XENVBD_FDO_H
-#define _XENVBD_FDO_H
-
-typedef struct _XENVBD_FDO XENVBD_FDO, *PXENVBD_FDO;
+#ifndef _XENVBD_ADAPTER_H
+#define _XENVBD_ADAPTER_H
 
 #include <ntddk.h>
-#include <ntstrsafe.h>
-#include <xenvbd-storport.h>
+
+typedef struct _XENVBD_ADAPTER XENVBD_ADAPTER, *PXENVBD_ADAPTER;
+
+#include <storport.h>
 #include "pdo.h"
 #include <store_interface.h>
 #include <evtchn_interface.h>
@@ -45,135 +45,118 @@ typedef struct _XENVBD_FDO XENVBD_FDO, *PXENVBD_FDO;
 #include <suspend_interface.h>
 #include <unplug_interface.h>
 
-// Reference Counting
-extern LONG
-__FdoReference(
-    __in PXENVBD_FDO                 Fdo,
-    __in PCHAR                       Caller
-    );
-
-#define FdoReference(_x_) __FdoReference(_x_, __FUNCTION__)
-
-extern LONG
-__FdoDereference(
-    __in PXENVBD_FDO                 Fdo,
-    __in PCHAR                       Caller
-    );
-
-#define FdoDereference(_x_) __FdoDereference(_x_, __FUNCTION__)
-
 // Link PDOs
 extern BOOLEAN
-FdoLinkPdo(
-    __in PXENVBD_FDO                 Fdo,
+AdapterLinkPdo(
+    __in PXENVBD_ADAPTER                 Adapter,
     __in PXENVBD_PDO                 Pdo
     );
 
 extern BOOLEAN
-FdoUnlinkPdo(
-    __in PXENVBD_FDO                 Fdo,
+AdapterUnlinkPdo(
+    __in PXENVBD_ADAPTER                 Adapter,
     __in PXENVBD_PDO                 Pdo
     );
 // Query Methods
 __checkReturn
 extern PDEVICE_OBJECT
-FdoGetDeviceObject(
-    __in PXENVBD_FDO                 Fdo
+AdapterGetDeviceObject(
+    __in PXENVBD_ADAPTER                 Adapter
     );
 
 extern ULONG
-FdoSizeofXenvbdFdo(
+AdapterSizeofXenvbdAdapter(
     );
 
 extern PCHAR
-FdoEnum(
-    __in PXENVBD_FDO                 Fdo
+AdapterEnum(
+    __in PXENVBD_ADAPTER                 Adapter
     );
 
 // SRB Methods
 extern VOID
-FdoStartSrb(
-    __in PXENVBD_FDO                 Fdo,
+AdapterStartSrb(
+    __in PXENVBD_ADAPTER                 Adapter,
     __in PSCSI_REQUEST_BLOCK         Srb
     );
 
 extern VOID
-FdoCompleteSrb(
-    __in PXENVBD_FDO                 Fdo,
+AdapterCompleteSrb(
+    __in PXENVBD_ADAPTER                 Adapter,
     __in PSCSI_REQUEST_BLOCK         Srb
     );
 
 // StorPort Methods
 extern BOOLEAN
-FdoResetBus(
-    __in PXENVBD_FDO                 Fdo
+AdapterResetBus(
+    __in PXENVBD_ADAPTER                 Adapter
     );
 
 extern ULONG
-FdoFindAdapter(
-    __in PXENVBD_FDO                 Fdo,
+AdapterFindAdapter(
+    __in PXENVBD_ADAPTER                 Adapter,
     __inout PPORT_CONFIGURATION_INFORMATION  ConfigInfo
     );
 
 extern BOOLEAN 
-FdoBuildIo(
-    __in PXENVBD_FDO                 Fdo,
+AdapterBuildIo(
+    __in PXENVBD_ADAPTER                 Adapter,
     __in PSCSI_REQUEST_BLOCK         Srb
     );
 
 extern BOOLEAN 
-FdoStartIo(
-    __in PXENVBD_FDO                 Fdo,
+AdapterStartIo(
+    __in PXENVBD_ADAPTER                 Adapter,
     __in PSCSI_REQUEST_BLOCK         Srb
     );
 
 __checkReturn
 extern NTSTATUS
-FdoForwardPnp(
-    __in PXENVBD_FDO                Fdo,
+AdapterForwardPnp(
+    __in PXENVBD_ADAPTER                Adapter,
     __in PDEVICE_OBJECT             DeviceObject,
     __in PIRP                       Irp
     );
 
 __checkReturn
 extern NTSTATUS
-FdoDispatchPnp(
-    __in PXENVBD_FDO                 Fdo,
+AdapterDispatchPnp(
+    __in PXENVBD_ADAPTER                 Adapter,
     __in PDEVICE_OBJECT              DeviceObject,
     __in PIRP                        Irp
     );
 
 __checkReturn
 extern NTSTATUS
-FdoDispatchPower(
-    __in PXENVBD_FDO                 Fdo,
+AdapterDispatchPower(
+    __in PXENVBD_ADAPTER                 Adapter,
     __in PDEVICE_OBJECT              DeviceObject,
     __in PIRP                        Irp
     );
 
 extern PXENBUS_STORE_INTERFACE
-FdoAcquireStore(
-    __in PXENVBD_FDO                 Fdo
+AdapterAcquireStore(
+    __in PXENVBD_ADAPTER                 Adapter
     );
 
 extern PXENBUS_EVTCHN_INTERFACE
-FdoAcquireEvtchn(
-    __in PXENVBD_FDO                 Fdo
+AdapterAcquireEvtchn(
+    __in PXENVBD_ADAPTER                 Adapter
     );
 
 extern PXENBUS_GNTTAB_INTERFACE
-FdoAcquireGnttab(
-    __in PXENVBD_FDO                 Fdo
+AdapterAcquireGnttab(
+    __in PXENVBD_ADAPTER                 Adapter
     );
 
 extern PXENBUS_DEBUG_INTERFACE
-FdoAcquireDebug(
-    __in PXENVBD_FDO                 Fdo
+AdapterAcquireDebug(
+    __in PXENVBD_ADAPTER                 Adapter
     );
 
 extern PXENBUS_SUSPEND_INTERFACE
-FdoAcquireSuspend(
-    __in PXENVBD_FDO                 Fdo
+AdapterAcquireSuspend(
+    __in PXENVBD_ADAPTER                 Adapter
     );
 
-#endif // _XENVBD_FDO_H
+#endif // _XENVBD_ADAPTER_H
