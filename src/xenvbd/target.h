@@ -29,10 +29,10 @@
  * SUCH DAMAGE.
  */ 
 
-#ifndef _XENVBD_PDO_H
-#define _XENVBD_PDO_H
+#ifndef _XENVBD_TARGET_H
+#define _XENVBD_TARGET_H
 
-typedef struct _XENVBD_PDO XENVBD_PDO, *PXENVBD_PDO;
+typedef struct _XENVBD_TARGET XENVBD_TARGET, *PXENVBD_TARGET;
 
 #include <ntddk.h>
 #include <ntstrsafe.h>
@@ -43,15 +43,15 @@ typedef struct _XENVBD_PDO XENVBD_PDO, *PXENVBD_PDO;
 #include <debug_interface.h>
 
 extern VOID
-PdoDebugCallback(
-    __in PXENVBD_PDO             Pdo,
+TargetDebugCallback(
+    __in PXENVBD_TARGET             Target,
     __in PXENBUS_DEBUG_INTERFACE Debug
     );
 
 // Creation/Deletion
 __checkReturn
 extern BOOLEAN
-PdoCreate(
+TargetCreate(
     __in PXENVBD_ADAPTER             Adapter,
     __in __nullterminated PCHAR  DeviceId,
     __in ULONG                   TargetId,
@@ -59,171 +59,171 @@ PdoCreate(
     );
 
 extern VOID
-PdoDestroy(
-    __in PXENVBD_PDO             Pdo
+TargetDestroy(
+    __in PXENVBD_TARGET             Target
     );
 
 __checkReturn
 extern NTSTATUS
-PdoD3ToD0(
-    __in PXENVBD_PDO             Pdo
+TargetD3ToD0(
+    __in PXENVBD_TARGET             Target
     );
 
 extern VOID
-PdoD0ToD3(
-    __in PXENVBD_PDO             Pdo
+TargetD0ToD3(
+    __in PXENVBD_TARGET             Target
     );
 
 // PnP States
 extern VOID
-PdoSetMissing(
-    __in PXENVBD_PDO             Pdo,
+TargetSetMissing(
+    __in PXENVBD_TARGET             Target,
     __in __nullterminated const CHAR* Reason
     );
 
 __checkReturn
 extern BOOLEAN
-PdoIsMissing(
-    __in PXENVBD_PDO             Pdo
+TargetIsMissing(
+    __in PXENVBD_TARGET             Target
     );
 
 extern const CHAR*
-PdoMissingReason(
-    __in PXENVBD_PDO            Pdo
+TargetMissingReason(
+    __in PXENVBD_TARGET            Target
     );
 
 __checkReturn
 extern BOOLEAN
-PdoIsEmulatedUnplugged(
-    __in PXENVBD_PDO             Pdo
+TargetIsEmulatedUnplugged(
+    __in PXENVBD_TARGET             Target
     );
 
 extern VOID
-PdoSetDevicePnpState(
-    __in PXENVBD_PDO             Pdo,
+TargetSetDevicePnpState(
+    __in PXENVBD_TARGET             Target,
     __in DEVICE_PNP_STATE        State
     );
 
 __checkReturn
 extern DEVICE_PNP_STATE
-PdoGetDevicePnpState(
-    __in PXENVBD_PDO             Pdo
+TargetGetDevicePnpState(
+    __in PXENVBD_TARGET             Target
     );
 
 // Reference Counting
 extern LONG
-__PdoReference(
-    __in PXENVBD_PDO             Pdo,
+__TargetReference(
+    __in PXENVBD_TARGET             Target,
     __in PCHAR                   Caller
     );
 
-#define PdoReference(_x_) __PdoReference(_x_, __FUNCTION__)
+#define TargetReference(_x_) __TargetReference(_x_, __FUNCTION__)
 
 extern LONG
-__PdoDereference(
-    __in PXENVBD_PDO             Pdo,
+__TargetDereference(
+    __in PXENVBD_TARGET             Target,
     __in PCHAR                   Caller
     );
 
-#define PdoDereference(_x_) __PdoDereference(_x_, __FUNCTION__)
+#define TargetDereference(_x_) __TargetDereference(_x_, __FUNCTION__)
 
 // Query Methods
 extern ULONG
-PdoGetTargetId(
-    __in PXENVBD_PDO             Pdo
+TargetGetTargetId(
+    __in PXENVBD_TARGET             Target
     );
 
 __checkReturn
 extern PDEVICE_OBJECT
-PdoGetDeviceObject(
-    __in PXENVBD_PDO             Pdo
+TargetGetDeviceObject(
+    __in PXENVBD_TARGET             Target
     );
 
 extern VOID
-PdoSetDeviceObject(
-    __in PXENVBD_PDO             Pdo,
+TargetSetDeviceObject(
+    __in PXENVBD_TARGET             Target,
     __in PDEVICE_OBJECT          DeviceObject
     );
 
 __checkReturn
 extern BOOLEAN
-PdoIsPaused(
-    __in PXENVBD_PDO             Pdo
+TargetIsPaused(
+    __in PXENVBD_TARGET             Target
     );
 
 __checkReturn
 extern ULONG
-PdoOutstandingReqs(
-    __in PXENVBD_PDO             Pdo
+TargetOutstandingReqs(
+    __in PXENVBD_TARGET             Target
     );
 
 __checkReturn
 extern PXENVBD_ADAPTER
-PdoGetAdapter( 
-    __in PXENVBD_PDO             Pdo
+TargetGetAdapter( 
+    __in PXENVBD_TARGET             Target
     );
 
 extern ULONG
-PdoSectorSize(
-    __in PXENVBD_PDO             Pdo
+TargetSectorSize(
+    __in PXENVBD_TARGET             Target
     );
 
 // Queue-Related
 extern VOID
-PdoSubmitRequests(
-    __in PXENVBD_PDO             Pdo
+TargetSubmitRequests(
+    __in PXENVBD_TARGET             Target
     );
 
 extern VOID
-PdoCompleteResponse(
-    __in PXENVBD_PDO             Pdo,
+TargetCompleteResponse(
+    __in PXENVBD_TARGET             Target,
     __in ULONG                   Tag,
     __in SHORT                   Status
     );
 
 extern VOID
-PdoPreResume(
-    __in PXENVBD_PDO             Pdo
+TargetPreResume(
+    __in PXENVBD_TARGET             Target
     );
 
 extern VOID
-PdoPostResume(
-    __in PXENVBD_PDO             Pdo
+TargetPostResume(
+    __in PXENVBD_TARGET             Target
     );
 
 // StorPort Methods
 extern VOID
-PdoReset(
-    __in PXENVBD_PDO             Pdo
+TargetReset(
+    __in PXENVBD_TARGET             Target
     );
 
 __checkReturn
 extern BOOLEAN
-PdoStartIo(
-    __in PXENVBD_PDO             Pdo,
+TargetStartIo(
+    __in PXENVBD_TARGET             Target,
     __in PSCSI_REQUEST_BLOCK     Srb
     );
 
 extern VOID
-PdoSrbPnp(
-    __in PXENVBD_PDO             Pdo,
+TargetSrbPnp(
+    __in PXENVBD_TARGET             Target,
     __in PSCSI_PNP_REQUEST_BLOCK Srb
     );
 
 // PnP Handler
 __checkReturn
 extern NTSTATUS
-PdoDispatchPnp(
-    __in PXENVBD_PDO             Pdo,
+TargetDispatchPnp(
+    __in PXENVBD_TARGET             Target,
     __in PDEVICE_OBJECT          DeviceObject,
     __in PIRP                    Irp
     );
 
 __drv_maxIRQL(DISPATCH_LEVEL)
 extern VOID
-PdoIssueDeviceEject(
-    __in PXENVBD_PDO             Pdo,
+TargetIssueDeviceEject(
+    __in PXENVBD_TARGET             Target,
     __in __nullterminated const CHAR* Reason
     );
 
-#endif // _XENVBD_PDO_H
+#endif // _XENVBD_TARGET_H
