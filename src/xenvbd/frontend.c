@@ -29,6 +29,9 @@
  * SUCH DAMAGE.
  */ 
 
+#include <ntddk.h>
+#include <ntstrsafe.h>
+
 #include "frontend.h"
 #include "registry.h"
 #include "driver.h"

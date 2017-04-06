@@ -88,33 +88,8 @@ typedef struct _XENVBD_REQUEST {
 // SRBExtension - context for SRBs
 typedef struct _XENVBD_SRBEXT {
     PSCSI_REQUEST_BLOCK     Srb;
-    LIST_ENTRY              Entry;
-    LONG                    Count;
+    LIST_ENTRY              ListEntry;
+    LONG                    RequestCount;
 } XENVBD_SRBEXT, *PXENVBD_SRBEXT;
-
-FORCEINLINE PXENVBD_SRBEXT
-GetSrbExt(
-    __in PSCSI_REQUEST_BLOCK     Srb
-    )
-{
-    if (Srb && Srb->Function != SRB_FUNCTION_STORAGE_REQUEST_BLOCK) {
-        ASSERT3P(Srb->SrbExtension, !=, NULL);
-        return Srb->SrbExtension;
-    }
-    return NULL;
-}
-
-FORCEINLINE VOID
-InitSrbExt(
-    __in PSCSI_REQUEST_BLOCK    Srb
-    )
-{
-    PXENVBD_SRBEXT  SrbExt = GetSrbExt(Srb);
-    if (SrbExt) {
-        RtlZeroMemory(SrbExt, sizeof(XENVBD_SRBEXT));
-        SrbExt->Srb = Srb;
-    }
-    Srb->SrbStatus = SRB_STATUS_INVALID_REQUEST;
-}
 
 #endif // _XENVBD_SRBEXT_H

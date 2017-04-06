@@ -36,7 +36,7 @@
 
 typedef struct _XENVBD_ADAPTER XENVBD_ADAPTER, *PXENVBD_ADAPTER;
 
-#include <storport.h>
+#include "srbext.h"
 #include <store_interface.h>
 #include <evtchn_interface.h>
 #include <gnttab_interface.h>
@@ -66,8 +66,13 @@ AdapterIsTargetEmulated(
 
 extern VOID
 AdapterCompleteSrb(
-    IN  PXENVBD_ADAPTER     Adapter,
-    IN  PSCSI_REQUEST_BLOCK Srb
+    IN  PXENVBD_ADAPTER Adapter,
+    IN  PXENVBD_SRBEXT  SrbExt
+    );
+
+extern VOID
+AdapterTargetListChanged(
+    IN  PXENVBD_ADAPTER     Adapter
     );
 
 extern NTSTATUS

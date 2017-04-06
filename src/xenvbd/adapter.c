@@ -87,9 +87,9 @@ struct _XENVBD_ADAPTER {
     KEVENT                      ScanEvent;
     PXENBUS_STORE_WATCH         ScanWatch;
 
-    ULONG                       BuildIo;
-    ULONG                       StartIo;
-    ULONG                       Completed;
+    LONG                        BuildIo;
+    LONG                        StartIo;
+    LONG                        Completed;
 };
 
 static FORCEINLINE PVOID
@@ -498,9 +498,8 @@ __AdapterEnumerate(
     }
 
     if (NeedInvalidate)
-        StorPortNotification(BusChangeDetected,
-                             Adapter,
-                             NULL);
+        AdapterTargetListChanged(Adapter);
+
     if (NeedReboot)
         DriverRequestReboot();
 }
@@ -906,7 +905,7 @@ AdapterDebugCallback(
                  PowerDeviceStateName(Adapter->DevicePower));
     XENBUS_DEBUG(Printf, 
                  &Adapter->DebugInterface,
-                 "ADAPTER: Srbs            : %u built, %u started, %u completed\n",
+                 "ADAPTER: Srbs            : %d built, %d started, %d completed\n",
                  Adapter->BuildIo,
                  Adapter->StartIo,
                  Adapter->Completed);
@@ -1115,6 +1114,26 @@ AdapterDevicePowerThread(
     return STATUS_SUCCESS;
 }
 
+static VOID
+AdapterUnplugRequest(
+    IN  PXENVBD_ADAPTER Adapter,
+    IN  BOOLEAN         Make
+    )
+{
+    NTSTATUS            status;
+
+    status = XENBUS_UNPLUG(Acquire, &Adapter->UnplugInterface);
+    if (!NT_SUCCESS(status))
+        return;
+
+    XENBUS_UNPLUG(Request,
+                  &Adapter->UnplugInterface,
+                  XENBUS_UNPLUG_DEVICE_TYPE_DISKS,
+                  Make);
+
+    XENBUS_UNPLUG(Release, &Adapter->UnplugInterface);
+}
+
 static NTSTATUS
 __AdapterQueryInterface(
     IN  PXENVBD_ADAPTER Adapter,
@@ -1276,6 +1295,7 @@ AdapterInitialize(
     if (!NT_SUCCESS(status))
         goto fail9;
 
+    AdapterUnplugRequest(Adapter, TRUE);
     return STATUS_SUCCESS;
 
 fail9:
@@ -1334,6 +1354,8 @@ AdapterTeardown(
     ULONG               TargetId;
 
     ASSERT3U(Adapter->DevicePower, ==, PowerDeviceD3);
+
+    AdapterUnplugRequest(Adapter, FALSE);
 
     ThreadAlert(Adapter->DevicePowerThread);
     ThreadJoin(Adapter->DevicePowerThread);
@@ -1395,37 +1417,329 @@ AdapterTeardown(
     Trace("<===== (%d)\n", KeGetCurrentIrql());
 }
 
-VOID
-AdapterCompleteSrb(
+static BOOLEAN
+AdapterPullupSrb(
     IN  PXENVBD_ADAPTER     Adapter,
     IN  PSCSI_REQUEST_BLOCK Srb
     )
 {
+    // walk ScatterGather list, add bounces where needed
+    UNREFERENCED_PARAMETER(Adapter);
+    UNREFERENCED_PARAMETER(Srb);
+    return TRUE;
+}
+
+static VOID
+AdapterPulldownSrb(
+    IN  PXENVBD_ADAPTER     Adapter,
+    IN  PSCSI_REQUEST_BLOCK Srb
+    )
+{
+    // foreach ScatterGather entry, unbounce it
+    UNREFERENCED_PARAMETER(Adapter);
+    UNREFERENCED_PARAMETER(Srb);
+}
+
+VOID
+AdapterCompleteSrb(
+    IN  PXENVBD_ADAPTER Adapter,
+    IN  PXENVBD_SRBEXT  SrbExt
+    )
+{
+    PSCSI_REQUEST_BLOCK Srb = SrbExt->Srb;
+
     ASSERT3U(Srb->SrbStatus, !=, SRB_STATUS_PENDING);
 
-    ++Adapter->Completed;
+    if (Srb->Function == SRB_FUNCTION_EXECUTE_SCSI)
+        AdapterPulldownSrb(Adapter, Srb);
+
+    InterlockedIncrement(&Adapter->Completed);
 
     StorPortNotification(RequestComplete, Adapter, Srb);
 }
 
-static VOID
-AdapterUnplugRequest(
-    IN  PXENVBD_ADAPTER Adapter,
-    IN  BOOLEAN         Make
+VOID
+AdapterTargetListChanged(
+    IN  PXENVBD_ADAPTER     Adapter
     )
 {
-    NTSTATUS            status;
+    Trace("=====>\n");
+    StorPortNotification(BusChangeDetected,
+                         Adapter,
+                         NULL);
+    Trace("<=====\n");
+}
 
-    status = XENBUS_UNPLUG(Acquire, &Adapter->UnplugInterface);
+static FORCEINLINE VOID
+__AdapterSrbPnp(
+    IN  PXENVBD_ADAPTER         Adapter,
+    IN  PSCSI_PNP_REQUEST_BLOCK Srb
+    )
+{
+    if (!(Srb->SrbPnPFlags & SRB_PNP_FLAGS_ADAPTER_REQUEST)) {
+        PXENVBD_TARGET          Target;
+
+        Target = AdapterGetTarget(Adapter, Srb->TargetId);
+        if (Target) {
+            TargetSrbPnp(Target, Srb);
+        }
+    }
+}
+
+HW_RESET_BUS        AdapterHwResetBus;
+
+BOOLEAN
+AdapterHwResetBus(
+    IN  PVOID       DevExt,
+    IN  ULONG       PathId
+    )
+{
+    PXENVBD_ADAPTER Adapter = DevExt;
+    ULONG           TargetId;
+
+    UNREFERENCED_PARAMETER(PathId);
+
+    Verbose("====>\n");
+    for (TargetId = 0; TargetId < XENVBD_MAX_TARGETS; ++TargetId) {
+        PXENVBD_TARGET Target = AdapterGetTarget(Adapter, TargetId);
+        if (Target == NULL)
+            continue;
+
+        TargetReset(Target);
+    }
+    Verbose("<====\n");
+
+    return TRUE;
+}
+
+HW_BUILDIO          AdapterHwBuildIo;
+
+BOOLEAN 
+AdapterHwBuildIo(
+    IN  PVOID               DevExt,
+    IN  PSCSI_REQUEST_BLOCK Srb
+    )
+{
+    PXENVBD_ADAPTER         Adapter = DevExt;
+    PXENVBD_SRBEXT          SrbExt = Srb->SrbExtension;
+    PXENVBD_TARGET          Target;
+
+    RtlZeroMemory(SrbExt, sizeof(XENVBD_SRBEXT));
+    SrbExt->Srb = Srb;
+    InitializeListHead(&SrbExt->ListEntry);
+
+    switch (Srb->Function) {
+    case SRB_FUNCTION_EXECUTE_SCSI:
+        Srb->SrbStatus = SRB_STATUS_INVALID_TARGET_ID;
+        Target = AdapterGetTarget(Adapter, Srb->TargetId);
+        if (Target == NULL)
+            break;
+        Srb->SrbStatus = SRB_STATUS_ERROR;
+        if (!AdapterPullupSrb(Adapter, Srb))
+            break;
+        TargetPrepareSrb(Target, SrbExt);
+        break;
+
+    case SRB_FUNCTION_RESET_DEVICE:
+    case SRB_FUNCTION_FLUSH:
+    case SRB_FUNCTION_SHUTDOWN:
+        Srb->SrbStatus = SRB_STATUS_INVALID_TARGET_ID;
+        Target = AdapterGetTarget(Adapter, Srb->TargetId);
+        if (Target == NULL)
+            break;
+        // Set pending, so StartIo handles this SRB
+        Srb->SrbStatus = SRB_STATUS_PENDING;
+        break;
+
+    case SRB_FUNCTION_PNP:
+        __AdapterSrbPnp(Adapter, (PSCSI_PNP_REQUEST_BLOCK)Srb);
+        Srb->SrbStatus = SRB_STATUS_SUCCESS;
+        break;
+
+    case SRB_FUNCTION_ABORT_COMMAND:
+        Srb->SrbStatus = SRB_STATUS_ABORT_FAILED;
+        break;
+
+    case SRB_FUNCTION_RESET_BUS:
+        Srb->SrbStatus = SRB_STATUS_SUCCESS;
+        AdapterHwResetBus(Adapter, Srb->PathId);
+        break;
+        
+    default:
+        Srb->SrbStatus = SRB_STATUS_INVALID_REQUEST;
+        break;
+    }
+
+    if (Srb->SrbStatus == SRB_STATUS_PENDING)
+        return TRUE;
+    
+    AdapterCompleteSrb(Adapter, SrbExt);
+    return FALSE;
+}
+
+HW_STARTIO          AdapterHwStartIo;
+
+BOOLEAN 
+AdapterHwStartIo(
+    IN  PVOID               DevExt,
+    IN  PSCSI_REQUEST_BLOCK Srb
+    )
+{
+    PXENVBD_ADAPTER         Adapter = DevExt;
+    PXENVBD_SRBEXT          SrbExt = Srb->SrbExtension;
+    PXENVBD_TARGET          Target;
+
+    Srb->SrbStatus = SRB_STATUS_INVALID_TARGET_ID;
+    Target = AdapterGetTarget(Adapter, Srb->TargetId);
+    if (Target) {
+        switch (Srb->Function) {
+        case SRB_FUNCTION_EXECUTE_SCSI:
+            TargetStartSrb(Target, SrbExt);
+            break;
+
+        case SRB_FUNCTION_RESET_DEVICE:
+            TargetReset(Target);
+            Srb->SrbStatus = SRB_STATUS_SUCCESS;
+            break;
+
+        case SRB_FUNCTION_FLUSH:
+            TargetFlush(Target, SrbExt);
+            break;
+
+        case SRB_FUNCTION_SHUTDOWN:
+            TargetShutdown(Target, SrbExt);
+            break;
+
+        default:
+            Srb->SrbStatus = SRB_STATUS_INVALID_REQUEST;
+            break;
+        }
+    }
+
+    if (Srb->SrbStatus != SRB_STATUS_PENDING)
+        AdapterCompleteSrb(Adapter, SrbExt);
+
+    return TRUE;
+}
+
+HW_ADAPTER_CONTROL  AdapterHwAdapterControl;
+
+SCSI_ADAPTER_CONTROL_STATUS
+AdapterHwAdapterControl(
+    IN  PVOID                       DevExt,
+    IN  SCSI_ADAPTER_CONTROL_TYPE   ControlType,
+    IN  PVOID                       Parameters
+    )
+{
+    PSCSI_SUPPORTED_CONTROL_TYPE_LIST   List;
+
+    UNREFERENCED_PARAMETER(DevExt);
+
+    switch (ControlType) {
+    case ScsiQuerySupportedControlTypes:
+        List = Parameters;
+        List->SupportedTypeList[ScsiQuerySupportedControlTypes] = TRUE;
+        break;
+
+    default:
+        break;
+    }
+    return ScsiAdapterControlSuccess;
+}
+
+HW_FIND_ADAPTER     AdapterHwFindAdapter;
+
+ULONG
+AdapterHwFindAdapter(
+    IN  PVOID                               DevExt,
+    IN  PVOID                               Context,
+    IN  PVOID                               BusInformation,
+    IN  PCHAR                               ArgumentString,
+    IN OUT PPORT_CONFIGURATION_INFORMATION  ConfigInfo,
+    OUT PBOOLEAN                            Again
+    )
+{
+    PXENVBD_ADAPTER                         Adapter = DevExt;
+    PDEVICE_OBJECT                          DeviceObject;
+    PDEVICE_OBJECT                          PhysicalDeviceObject;
+    PDEVICE_OBJECT                          LowerDeviceObject;
+    NTSTATUS                                status;
+
+    UNREFERENCED_PARAMETER(Context);
+    UNREFERENCED_PARAMETER(BusInformation);
+    UNREFERENCED_PARAMETER(ArgumentString);
+    UNREFERENCED_PARAMETER(Again);
+
+    // setup config info
+    ConfigInfo->MaximumTransferLength       = XENVBD_MAX_TRANSFER_LENGTH;
+    ConfigInfo->NumberOfPhysicalBreaks      = XENVBD_MAX_PHYSICAL_BREAKS;
+    ConfigInfo->AlignmentMask               = 0; // Byte-Aligned
+    ConfigInfo->NumberOfBuses               = 1;
+    ConfigInfo->InitiatorBusId[0]           = 1;
+    ConfigInfo->ScatterGather               = TRUE;
+    ConfigInfo->Master                      = TRUE;
+    ConfigInfo->CachesData                  = FALSE;
+    ConfigInfo->MapBuffers                  = STOR_MAP_NON_READ_WRITE_BUFFERS;
+    ConfigInfo->MaximumNumberOfTargets      = XENVBD_MAX_TARGETS;
+    ConfigInfo->MaximumNumberOfLogicalUnits = 1;
+    ConfigInfo->WmiDataProvider             = FALSE; // should be TRUE
+    ConfigInfo->SynchronizationModel        = StorSynchronizeFullDuplex;
+
+    if (ConfigInfo->Dma64BitAddresses == SCSI_DMA64_SYSTEM_SUPPORTED)
+        ConfigInfo->Dma64BitAddresses = SCSI_DMA64_MINIPORT_SUPPORTED;
+
+    // We need to do this to avoid an assertion in a checked kernel
+    (VOID) StorPortGetUncachedExtension(DevExt, ConfigInfo, PAGE_SIZE);
+
+    (VOID) StorPortGetDeviceObjects(DevExt,
+                                    &DeviceObject,
+                                    &PhysicalDeviceObject,
+                                    &LowerDeviceObject);
+    if (Adapter->DeviceObject == DeviceObject)
+        return SP_RETURN_FOUND;
+
+    status = AdapterInitialize(Adapter,
+                               DeviceObject,
+                               PhysicalDeviceObject,
+                               LowerDeviceObject);
     if (!NT_SUCCESS(status))
-        return;
+        goto fail1;
 
-    XENBUS_UNPLUG(Request,
-                  &Adapter->UnplugInterface,
-                  XENBUS_UNPLUG_DEVICE_TYPE_DISKS,
-                  Make);
+    status = AdapterD3ToD0(Adapter);
+    if (!NT_SUCCESS(status))
+        goto fail2;
 
-    XENBUS_UNPLUG(Release, &Adapter->UnplugInterface);
+    DriverSetAdapter(Adapter);
+    return SP_RETURN_FOUND;
+
+fail2:
+    Error("fail2\n");
+    AdapterTeardown(Adapter);
+fail1:
+    Error("fail1\n");
+    return SP_RETURN_ERROR;
+}
+
+HW_INITIALIZE   AdapterHwInitialize;
+
+BOOLEAN 
+AdapterHwInitialize(
+    IN  PVOID   DevExt
+    )
+{
+    UNREFERENCED_PARAMETER(DevExt);
+    return TRUE;
+}
+
+HW_INTERRUPT    AdapterHwInterrupt;
+
+BOOLEAN 
+AdapterHwInterrupt(
+    IN  PVOID   DevExt
+    )
+{
+    UNREFERENCED_PARAMETER(DevExt);
+    return TRUE;
 }
 
 static PXENVBD_TARGET
@@ -1570,7 +1884,6 @@ AdapterDispatchPnp(
     switch (Stack->MinorFunction) {
     case IRP_MN_REMOVE_DEVICE:
         AdapterD0ToD3(Adapter);
-        AdapterUnplugRequest(Adapter, FALSE);
         AdapterTeardown(Adapter);
         break;
 
@@ -1639,239 +1952,6 @@ AdapterDispatchPower(
     }
 
     return status;
-}
-
-HW_RESET_BUS        AdapterHwResetBus;
-
-BOOLEAN
-AdapterHwResetBus(
-    IN  PVOID       DevExt,
-    IN  ULONG       PathId
-    )
-{
-    PXENVBD_ADAPTER Adapter = DevExt;
-    ULONG           TargetId;
-
-    UNREFERENCED_PARAMETER(PathId);
-
-    Verbose("====>\n");
-    for (TargetId = 0; TargetId < XENVBD_MAX_TARGETS; ++TargetId) {
-        PXENVBD_TARGET Target = AdapterGetTarget(Adapter, TargetId);
-        if (Target == NULL)
-            continue;
-
-        TargetReset(Target);
-    }
-    Verbose("<====\n");
-
-    return TRUE;
-}
-
-
-static FORCEINLINE VOID
-__AdapterSrbPnp(
-    IN  PXENVBD_ADAPTER         Adapter,
-    IN  PSCSI_PNP_REQUEST_BLOCK Srb
-    )
-{
-    if (!(Srb->SrbPnPFlags & SRB_PNP_FLAGS_ADAPTER_REQUEST)) {
-        PXENVBD_TARGET          Target;
-
-        Target = AdapterGetTarget(Adapter, Srb->TargetId);
-        if (Target) {
-            TargetSrbPnp(Target, Srb);
-        }
-    }
-}
-
-HW_BUILDIO          AdapterHwBuildIo;
-
-BOOLEAN 
-AdapterHwBuildIo(
-    IN  PVOID               DevExt,
-    IN  PSCSI_REQUEST_BLOCK Srb
-    )
-{
-    PXENVBD_ADAPTER         Adapter = DevExt;
-
-    InitSrbExt(Srb);
-
-    switch (Srb->Function) {
-    case SRB_FUNCTION_EXECUTE_SCSI:
-    case SRB_FUNCTION_RESET_DEVICE:
-    case SRB_FUNCTION_FLUSH:
-    case SRB_FUNCTION_SHUTDOWN:
-        ++Adapter->BuildIo;
-        return TRUE;
-
-        // dont pass to StartIo
-    case SRB_FUNCTION_PNP:
-        __AdapterSrbPnp(Adapter, (PSCSI_PNP_REQUEST_BLOCK)Srb);
-        Srb->SrbStatus = SRB_STATUS_SUCCESS;
-        break;
-    case SRB_FUNCTION_ABORT_COMMAND:
-        Srb->SrbStatus = SRB_STATUS_ABORT_FAILED;
-        break;
-    case SRB_FUNCTION_RESET_BUS:
-        Srb->SrbStatus = SRB_STATUS_SUCCESS;
-        AdapterHwResetBus(Adapter, Srb->PathId);
-        break;
-        
-    default:
-        break;
-    }
-    
-    StorPortNotification(RequestComplete, Adapter, Srb);
-    return FALSE;
-}
-
-HW_STARTIO          AdapterHwStartIo;
-
-BOOLEAN 
-AdapterHwStartIo(
-    IN  PVOID               DevExt,
-    IN  PSCSI_REQUEST_BLOCK Srb
-    )
-{
-    PXENVBD_ADAPTER         Adapter = DevExt;
-    PXENVBD_TARGET          Target;
-
-    Target = AdapterGetTarget(Adapter, Srb->TargetId);
-    if (Target == NULL)
-        goto fail1;
-
-    ++Adapter->StartIo;
-    if (TargetStartIo(Target, Srb))
-        AdapterCompleteSrb(Adapter, Srb);
-
-    return TRUE;
-
-fail1:
-    AdapterCompleteSrb(Adapter, Srb);
-    return TRUE;
-}
-
-HW_ADAPTER_CONTROL  AdapterHwAdapterControl;
-
-SCSI_ADAPTER_CONTROL_STATUS
-AdapterHwAdapterControl(
-    IN  PVOID                       DevExt,
-    IN  SCSI_ADAPTER_CONTROL_TYPE   ControlType,
-    IN  PVOID                       Parameters
-    )
-{
-    PSCSI_SUPPORTED_CONTROL_TYPE_LIST   List;
-
-    UNREFERENCED_PARAMETER(DevExt);
-
-    switch (ControlType) {
-    case ScsiQuerySupportedControlTypes:
-        List = Parameters;
-        List->SupportedTypeList[ScsiQuerySupportedControlTypes] = TRUE;
-        break;
-
-    default:
-        break;
-    }
-    return ScsiAdapterControlSuccess;
-}
-
-HW_FIND_ADAPTER     AdapterHwFindAdapter;
-
-ULONG
-AdapterHwFindAdapter(
-    IN  PVOID                               DevExt,
-    IN  PVOID                               Context,
-    IN  PVOID                               BusInformation,
-    IN  PCHAR                               ArgumentString,
-    IN OUT PPORT_CONFIGURATION_INFORMATION  ConfigInfo,
-    OUT PBOOLEAN                            Again
-    )
-{
-    PXENVBD_ADAPTER                         Adapter = DevExt;
-    PDEVICE_OBJECT                          DeviceObject;
-    PDEVICE_OBJECT                          PhysicalDeviceObject;
-    PDEVICE_OBJECT                          LowerDeviceObject;
-    NTSTATUS                                status;
-
-    UNREFERENCED_PARAMETER(Context);
-    UNREFERENCED_PARAMETER(BusInformation);
-    UNREFERENCED_PARAMETER(ArgumentString);
-    UNREFERENCED_PARAMETER(Again);
-
-    // setup config info
-    ConfigInfo->MaximumTransferLength       = XENVBD_MAX_TRANSFER_LENGTH;
-    ConfigInfo->NumberOfPhysicalBreaks      = XENVBD_MAX_PHYSICAL_BREAKS;
-    ConfigInfo->AlignmentMask               = 0; // Byte-Aligned
-    ConfigInfo->NumberOfBuses               = 1;
-    ConfigInfo->InitiatorBusId[0]           = 1;
-    ConfigInfo->ScatterGather               = TRUE;
-    ConfigInfo->Master                      = TRUE;
-    ConfigInfo->CachesData                  = FALSE;
-    ConfigInfo->MapBuffers                  = STOR_MAP_NON_READ_WRITE_BUFFERS;
-    ConfigInfo->MaximumNumberOfTargets      = XENVBD_MAX_TARGETS;
-    ConfigInfo->MaximumNumberOfLogicalUnits = 1;
-    ConfigInfo->WmiDataProvider             = FALSE; // should be TRUE
-    ConfigInfo->SynchronizationModel        = StorSynchronizeFullDuplex;
-
-    if (ConfigInfo->Dma64BitAddresses == SCSI_DMA64_SYSTEM_SUPPORTED)
-        ConfigInfo->Dma64BitAddresses = SCSI_DMA64_MINIPORT_SUPPORTED;
-
-    // We need to do this to avoid an assertion in a checked kernel
-    (VOID) StorPortGetUncachedExtension(DevExt, ConfigInfo, PAGE_SIZE);
-
-    (VOID) StorPortGetDeviceObjects(DevExt,
-                                    &DeviceObject,
-                                    &PhysicalDeviceObject,
-                                    &LowerDeviceObject);
-    if (Adapter->DeviceObject == DeviceObject)
-        return SP_RETURN_FOUND;
-
-    status = AdapterInitialize(Adapter,
-                               DeviceObject,
-                               PhysicalDeviceObject,
-                               LowerDeviceObject);
-    if (!NT_SUCCESS(status))
-        goto fail1;
-
-    AdapterUnplugRequest(Adapter, TRUE);
-
-    status = AdapterD3ToD0(Adapter);
-    if (!NT_SUCCESS(status))
-        goto fail2;
-
-    DriverSetAdapter(Adapter);
-    return SP_RETURN_FOUND;
-
-fail2:
-    Error("fail2\n");
-    AdapterUnplugRequest(Adapter, FALSE);
-    AdapterTeardown(Adapter);
-fail1:
-    Error("fail1\n");
-    return SP_RETURN_ERROR;
-}
-
-HW_INITIALIZE   AdapterHwInitialize;
-
-BOOLEAN 
-AdapterHwInitialize(
-    IN  PVOID   DevExt
-    )
-{
-    UNREFERENCED_PARAMETER(DevExt);
-    return TRUE;
-}
-
-HW_INTERRUPT    AdapterHwInterrupt;
-
-BOOLEAN 
-AdapterHwInterrupt(
-    IN  PVOID   DevExt
-    )
-{
-    UNREFERENCED_PARAMETER(DevExt);
-    return TRUE;
 }
 
 NTSTATUS

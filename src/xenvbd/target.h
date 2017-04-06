@@ -32,11 +32,10 @@
 #ifndef _XENVBD_TARGET_H
 #define _XENVBD_TARGET_H
 
+#include <ntddk.h>
+
 typedef struct _XENVBD_TARGET XENVBD_TARGET, *PXENVBD_TARGET;
 
-#include <ntddk.h>
-#include <ntstrsafe.h>
-#include <xenvbd-storport.h>
 #include "adapter.h"
 #include "srbext.h"
 #include "types.h"
@@ -181,14 +180,31 @@ TargetPostResume(
 // StorPort Methods
 extern VOID
 TargetReset(
-    __in PXENVBD_TARGET             Target
+    IN  PXENVBD_TARGET  Target
     );
 
-__checkReturn
-extern BOOLEAN
-TargetStartIo(
-    __in PXENVBD_TARGET             Target,
-    __in PSCSI_REQUEST_BLOCK     Srb
+extern VOID
+TargetPrepareSrb(
+    IN  PXENVBD_TARGET  Target,
+    IN  PXENVBD_SRBEXT  SrbExt
+    );
+
+extern VOID
+TargetStartSrb(
+    IN  PXENVBD_TARGET  Target,
+    IN  PXENVBD_SRBEXT  SrbExt
+    );
+
+extern VOID
+TargetFlush(
+    IN  PXENVBD_TARGET  Target,
+    IN  PXENVBD_SRBEXT  SrbExt
+    );
+
+extern VOID
+TargetShutdown(
+    IN  PXENVBD_TARGET  Target,
+    IN  PXENVBD_SRBEXT  SrbExt
     );
 
 extern VOID
