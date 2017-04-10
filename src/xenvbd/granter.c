@@ -32,50 +32,62 @@
 #include <ntddk.h>
 #include <ntstrsafe.h>
 
-#include "frontend.h"
+#include <gnttab_interface.h>
+#include <debug_interface.h>
+
+#include "granter.h"
 #include "target.h"
 #include "adapter.h"
+
 #include "util.h"
 #include "debug.h"
-#include "thread.h"
-#include <gnttab_interface.h>
+#include "assert.h"
 
 struct _XENVBD_GRANTER {
-    PXENVBD_FRONTEND                Frontend;
-    BOOLEAN                         Connected;
-    BOOLEAN                         Enabled;
+    PXENVBD_TARGET          Target;
+    BOOLEAN                 Connected;
+    BOOLEAN                 Enabled;
 
-    XENBUS_GNTTAB_INTERFACE         GnttabInterface;
-    PXENBUS_GNTTAB_CACHE            Cache;
-    KSPIN_LOCK                      Lock;
+    XENBUS_DEBUG_INTERFACE  DebugInterface;
+    XENBUS_GNTTAB_INTERFACE GnttabInterface;
 
-    USHORT                          BackendDomain;
-    LONG                            Current;
-    LONG                            Maximum;
+    PXENBUS_DEBUG_CALLBACK  DebugCallback;
+
+    PXENBUS_GNTTAB_CACHE    Cache;
+    KSPIN_LOCK              Lock;
+
+    LONG                    Current;
+    LONG                    Maximum;
 };
-#define GRANTER_POOL_TAG            'tnGX'
+#define GRANTER_POOL_TAG    'tnGX'
 
 static FORCEINLINE PVOID
 __GranterAllocate(
-    IN  ULONG                       Length
+    IN  ULONG   Size
     )
 {
-    return __AllocatePoolWithTag(NonPagedPool, Length, GRANTER_POOL_TAG);
+    PVOID       Buffer;
+    Buffer = ExAllocatePoolWithTag(NonPagedPool,
+                                   Size,
+                                   GRANTER_POOL_TAG);
+    if (Buffer)
+        RtlZeroMemory(Buffer, Size);
+    return Buffer;
 }
 
 static FORCEINLINE VOID
 __GranterFree(
-    IN  PVOID                       Buffer
+    IN  PVOID   Buffer
     )
 {
     if (Buffer)
-        __FreePoolWithTag(Buffer, GRANTER_POOL_TAG);
+        ExFreePoolWithTag(Buffer, GRANTER_POOL_TAG);
 }
 
 NTSTATUS
 GranterCreate(
-    IN  PXENVBD_FRONTEND            Frontend,
-    OUT PXENVBD_GRANTER*            Granter
+    IN  PXENVBD_TARGET      Target,
+    OUT PXENVBD_GRANTER*    Granter
     )
 {
     NTSTATUS    status;
@@ -85,7 +97,7 @@ GranterCreate(
     if (*Granter == NULL)
         goto fail1;
 
-    (*Granter)->Frontend = Frontend;
+    (*Granter)->Target = Target;
     KeInitializeSpinLock(&(*Granter)->Lock);
 
     return STATUS_SUCCESS;
@@ -96,10 +108,10 @@ fail1:
 
 VOID
 GranterDestroy(
-    IN  PXENVBD_GRANTER             Granter
+    IN  PXENVBD_GRANTER Granter
     )
 {
-    Granter->Frontend = NULL;
+    Granter->Target = NULL;
     RtlZeroMemory(&Granter->Lock, sizeof(KSPIN_LOCK));
 
     ASSERT(IsZeroMemory(Granter, sizeof(XENVBD_GRANTER)));
@@ -134,34 +146,54 @@ GranterReleaseLock(
     KeReleaseSpinLockFromDpcLevel(&Granter->Lock);
 }
 
-#define MAXNAMELEN  32
+static DECLSPEC_NOINLINE VOID
+GranterDebugCallback(
+    IN  PVOID       Context,
+    IN  BOOLEAN     Crashing
+    )
+{
+    PXENVBD_GRANTER Granter = Context;
+
+    UNREFERENCED_PARAMETER(Crashing);
+
+    XENBUS_DEBUG(Printf,
+                 &Granter->DebugInterface,
+                 "%u / %u Grants\n",
+                 Granter->Current,
+                 Granter->Maximum);
+    Granter->Maximum = Granter->Current;
+}
 
 NTSTATUS
 GranterConnect(
-    IN  PXENVBD_GRANTER             Granter,
-    IN  USHORT                      BackendDomain
+    IN  PXENVBD_GRANTER Granter
     )
 {
-    PXENVBD_ADAPTER Adapter = TargetGetAdapter(FrontendGetTarget(Granter->Frontend));
-    CHAR        Name[MAXNAMELEN];
-    NTSTATUS    status;
+    PXENVBD_ADAPTER     Adapter;
+    CHAR                Name[sizeof("xenvbd_XXXX_gnttab")];
+    NTSTATUS            status;
 
     ASSERT(Granter->Connected == FALSE);
 
+    Adapter = TargetGetAdapter(Granter->Target);
+
     AdapterGetGnttabInterface(Adapter, &Granter->GnttabInterface);
+    AdapterGetDebugInterface(Adapter, &Granter->DebugInterface);
 
     status = XENBUS_GNTTAB(Acquire, &Granter->GnttabInterface);
     if (!NT_SUCCESS(status))
         goto fail1;
 
-    Granter->BackendDomain = BackendDomain;
-
-    status = RtlStringCbPrintfA(Name,
-                                sizeof (Name),
-                                "disk_%u",
-                                FrontendGetTargetId(Granter->Frontend));
+    status = XENBUS_DEBUG(Acquire, &Granter->DebugInterface);
     if (!NT_SUCCESS(status))
         goto fail2;
+
+    status = RtlStringCbPrintfA(Name,
+                                sizeof(Name),
+                                "xenvbd_%u_gnttab",
+                                TargetGetTargetId(Granter->Target));
+    if (!NT_SUCCESS(status))
+        goto fail3;
 
     status = XENBUS_GNTTAB(CreateCache,
                            &Granter->GnttabInterface,
@@ -172,37 +204,56 @@ GranterConnect(
                            Granter,
                            &Granter->Cache);
     if (!NT_SUCCESS(status))
-        goto fail3;
+        goto fail4;
+
+    status = XENBUS_DEBUG(Register,
+                          &Granter->DebugInterface,
+                          __MODULE__,
+                          GranterDebugCallback,
+                          Granter,
+                          &Granter->DebugCallback);
+    if (!NT_SUCCESS(status))
+        goto fail5;
 
     Granter->Connected = TRUE;
     return STATUS_SUCCESS;
 
+fail5:
+    Error("fail5\n");
+    XENBUS_GNTTAB(DestroyCache,
+                  &Granter->GnttabInterface,
+                  Granter->Cache);
+    Granter->Cache = NULL;
+fail4:
+    Error("fail4\n");
 fail3:
+    Error("fail3\n");
+    XENBUS_DEBUG(Release, &Granter->DebugInterface);
+    RtlZeroMemory(&Granter->DebugInterface, sizeof(XENBUS_DEBUG_INTERFACE));
 fail2:
-    Granter->BackendDomain = 0;
+    Error("fail2\n");
     XENBUS_GNTTAB(Release, &Granter->GnttabInterface);
     RtlZeroMemory(&Granter->GnttabInterface, sizeof(XENBUS_GNTTAB_INTERFACE));
 fail1:
+    Error("fail1 %08x\n", status);
     return status;
 }
 
 NTSTATUS
 GranterStoreWrite(
-    IN  PXENVBD_GRANTER             Granter,
-    IN  PXENBUS_STORE_TRANSACTION   Transaction,
-    IN  PCHAR                       FrontendPath
+    IN  PXENVBD_GRANTER Granter,
+    IN  PVOID           Transaction
     )
 {
     UNREFERENCED_PARAMETER(Granter);
     UNREFERENCED_PARAMETER(Transaction);
-    UNREFERENCED_PARAMETER(FrontendPath);
 
     return STATUS_SUCCESS;
 }
 
 VOID
 GranterEnable(
-    IN  PXENVBD_GRANTER             Granter
+    IN  PXENVBD_GRANTER Granter
     )
 {
     ASSERT(Granter->Enabled == FALSE);
@@ -212,7 +263,7 @@ GranterEnable(
 
 VOID
 GranterDisable(
-    IN  PXENVBD_GRANTER             Granter
+    IN  PXENVBD_GRANTER Granter
     )
 {
     ASSERT(Granter->Enabled == TRUE);
@@ -222,41 +273,31 @@ GranterDisable(
 
 VOID
 GranterDisconnect(
-    IN  PXENVBD_GRANTER             Granter
+    IN  PXENVBD_GRANTER Granter
     )
 {
     ASSERT(Granter->Connected == TRUE);
 
-    ASSERT3S(Granter->Current, ==, 0);
+    Granter->Current = 0;
     Granter->Maximum = 0;
+
+    XENBUS_DEBUG(Deregister,
+                 &Granter->DebugInterface,
+                 Granter->DebugCallback);
+    Granter->DebugCallback = NULL;
 
     XENBUS_GNTTAB(DestroyCache,
                   &Granter->GnttabInterface,
                   Granter->Cache);
     Granter->Cache = NULL;
 
+    XENBUS_DEBUG(Release, &Granter->DebugInterface);
+    RtlZeroMemory(&Granter->DebugInterface, sizeof(XENBUS_DEBUG_INTERFACE));
+
     XENBUS_GNTTAB(Release, &Granter->GnttabInterface);
     RtlZeroMemory(&Granter->GnttabInterface, sizeof(XENBUS_GNTTAB_INTERFACE));
 
-    Granter->BackendDomain = 0;
     Granter->Connected = FALSE;
-}
-
-VOID
-GranterDebugCallback(
-    IN  PXENVBD_GRANTER             Granter,
-    IN  PXENBUS_DEBUG_INTERFACE     Debug
-    )
-{
-    XENBUS_DEBUG(Printf, Debug,
-                 "GRANTER: %s %s\n", 
-                 Granter->Connected ? "CONNECTED" : "DISCONNECTED",
-                 Granter->Enabled ? "ENABLED" : "DISABLED");
-    XENBUS_DEBUG(Printf, Debug,
-                 "GRANTER: %d / %d\n",
-                 Granter->Current,
-                 Granter->Maximum);
-    Granter->Maximum = Granter->Current;
 }
 
 NTSTATUS
@@ -279,7 +320,7 @@ GranterGet(
                            &Granter->GnttabInterface, 
                            Granter->Cache,
                            FALSE,
-                           Granter->BackendDomain,
+                           TargetGetBackendId(Granter->Target),
                            Pfn,
                            ReadOnly,
                            &Entry);
@@ -294,7 +335,9 @@ GranterGet(
     return STATUS_SUCCESS;
 
 fail2:
+    Error("fail2\n");
 fail1:
+    Error("fail1 %08x\n", status);
     return status;
 }
 

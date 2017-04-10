@@ -37,43 +37,16 @@
 #include <xen.h>
 #include "assert.h"
 
-#pragma pack(push, 1)
-typedef struct _BLKIF_SEGMENT {
-    ULONG                   GrantRef;
-    UCHAR                   First;
-    UCHAR                   Last;
-    USHORT                  __Padding;
-} BLKIF_SEGMENT, *PBLKIF_SEGMENT;
-#pragma pack(pop)
-
-#define XENVBD_MAX_SEGMENTS_PER_PAGE    (PAGE_SIZE / sizeof(BLKIF_SEGMENT))
-
-// Internal indirect context
-typedef struct _XENVBD_INDIRECT {
-    LIST_ENTRY              Entry;
-    PBLKIF_SEGMENT          Page;
-    PVOID                   Grant;
-    PMDL                    Mdl;
-} XENVBD_INDIRECT, *PXENVBD_INDIRECT;
-
-// Internal segment context
-typedef struct _XENVBD_SEGMENT {
-    LIST_ENTRY              Entry;
-    PVOID                   Grant;
-    UCHAR                   FirstSector;
-    UCHAR                   LastSector;
-    ULONG                   Length;
-    PVOID                   BufferId;
-    PVOID                   Buffer; // VirtAddr mapped to PhysAddr(s)
-    MDL                     Mdl;
-    PFN_NUMBER              Pfn[2];
-} XENVBD_SEGMENT, *PXENVBD_SEGMENT;
-
-// Internal request context
-typedef struct _XENVBD_REQUEST {
+typedef struct _XENVBD_SRBEXT {
     PSCSI_REQUEST_BLOCK     Srb;
-    LIST_ENTRY              Entry;
-    ULONG                   Id;
+    LIST_ENTRY              ListEntry;
+    LONG                    RequestCount;
+} XENVBD_SRBEXT, *PXENVBD_SRBEXT;
+
+typedef struct _XENVBD_REQUEST {
+    PXENVBD_SRBEXT          SrbExt;
+    LIST_ENTRY              ListEntry;
+    ULONG64                 Id; // = (ULONG64)(ULONG_PTR)this
 
     UCHAR                   Operation;  // BLKIF_OP_{READ/WRITE/BARRIER/DISCARD}
     UCHAR                   Flags;      // BLKIF_OP_DISCARD only
@@ -85,11 +58,35 @@ typedef struct _XENVBD_REQUEST {
     LIST_ENTRY              Indirects;  // BLKIF_OP_{READ/WRITE} with NrSegments > 11 only
 } XENVBD_REQUEST, *PXENVBD_REQUEST;
 
-// SRBExtension - context for SRBs
-typedef struct _XENVBD_SRBEXT {
-    PSCSI_REQUEST_BLOCK     Srb;
+#pragma pack(push, 1)
+typedef struct _BLKIF_SEGMENT {
+    ULONG                   GrantRef;
+    UCHAR                   First;
+    UCHAR                   Last;
+    USHORT                  __Padding;
+} BLKIF_SEGMENT, *PBLKIF_SEGMENT;
+#pragma pack(pop)
+
+#define XENVBD_MAX_SEGMENTS_PER_PAGE        (PAGE_SIZE / sizeof(BLKIF_SEGMENT))
+#define XENVBD_MAX_SEGMENTS_PER_INDIRECT    (XENVBD_MAX_SEGMENTS_PER_PAGE * 2) // limited Indirecting
+
+typedef struct _XENVBD_INDIRECT {
     LIST_ENTRY              ListEntry;
-    LONG                    RequestCount;
-} XENVBD_SRBEXT, *PXENVBD_SRBEXT;
+    PBLKIF_SEGMENT          Page;
+    PVOID                   Grant;
+    PMDL                    Mdl;
+} XENVBD_INDIRECT, *PXENVBD_INDIRECT;
+
+typedef struct _XENVBD_SEGMENT {
+    LIST_ENTRY              ListEntry;
+    PVOID                   Grant;
+    UCHAR                   FirstSector;
+    UCHAR                   LastSector;
+    ULONG                   Length;
+    PVOID                   BufferId;
+    PVOID                   Buffer; // VirtAddr mapped to PhysAddr(s)
+    MDL                     Mdl;
+    PFN_NUMBER              Pfn[2];
+} XENVBD_SEGMENT, *PXENVBD_SEGMENT;
 
 #endif // _XENVBD_SRBEXT_H

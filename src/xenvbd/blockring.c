@@ -29,227 +29,218 @@
  * SUCH DAMAGE.
  */ 
 
+#include <ntddk.h>
+#include <ntstrsafe.h>
+#include <stdlib.h>
+
+#include <xen.h>
+#include <gnttab_interface.h>
+#include <debug_interface.h>
+#include <evtchn_interface.h>
+
 #include "blockring.h"
-#include "frontend.h"
 #include "target.h"
 #include "adapter.h"
+#include "granter.h"
+#include "adapter.h"
+
 #include "util.h"
 #include "debug.h"
-#include "srbext.h"
-#include "driver.h"
-#include <stdlib.h>
-#include <xenvbd-ntstrsafe.h>
+#include "assert.h"
 
-#define TAG_HEADER                  'gaTX'
+#define XEN_IO_PROTO_ABI            "x86_64-abi"
 #define XENVBD_MAX_RING_PAGE_ORDER  (4)
 #define XENVBD_MAX_RING_PAGES       (1 << XENVBD_MAX_RING_PAGE_ORDER)
 
 struct _XENVBD_BLOCKRING {
-    PXENVBD_FRONTEND                Frontend;
-    BOOLEAN                         Connected;
-    BOOLEAN                         Enabled;
+    PXENVBD_TARGET          Target;
+    BOOLEAN                 Connected;
+    BOOLEAN                 Enabled;
 
-    XENBUS_STORE_INTERFACE          StoreInterface;
+    XENBUS_STORE_INTERFACE  StoreInterface;
+    XENBUS_DEBUG_INTERFACE  DebugInterface;
+    XENBUS_EVTCHN_INTERFACE EvtchnInterface;
 
-    KSPIN_LOCK                      Lock;
-    PMDL                            Mdl;
-    blkif_sring_t*                  SharedRing;
-    blkif_front_ring_t              FrontRing;
-    ULONG                           DeviceId;
-    ULONG                           Order;
-    PVOID                           Grants[XENVBD_MAX_RING_PAGES];
-    ULONG                           Submitted;
-    ULONG                           Received;
+    PXENBUS_DEBUG_CALLBACK  DebugCallback;
+
+    KSPIN_LOCK              Lock;
+    PMDL                    Mdl;
+    blkif_sring_t*          Shared;
+    blkif_front_ring_t      Front;
+    ULONG                   Order;
+    PVOID                   Grants[XENVBD_MAX_RING_PAGES];
+
+    PXENBUS_EVTCHN_CHANNEL  Channel;
+    KDPC                    Dpc;
+
+    ULONG                   Submitted;
+    ULONG                   Completed;
+    ULONG                   Interrupts;
+    ULONG                   Dpcs;
 };
 
-#define MAX_NAME_LEN                64
-#define BLOCKRING_POOL_TAG          'gnRX'
-
-#define XEN_IO_PROTO_ABI    "x86_64-abi"
+#define BLOCKRING_POOL_TAG  'gnRX'
+#define xen_mb              KeMemoryBarrier
+#define xen_wmb             KeMemoryBarrier
+#define xen_rmb             KeMemoryBarrier
 
 static FORCEINLINE PVOID
 __BlockRingAllocate(
-    IN  ULONG                       Length
+    IN  ULONG   Size
     )
 {
-    return __AllocatePoolWithTag(NonPagedPool, Length, BLOCKRING_POOL_TAG);
+    PVOID       Buffer;
+    Buffer = ExAllocatePoolWithTag(NonPagedPool,
+                                   Size,
+                                   BLOCKRING_POOL_TAG);
+    if (Buffer)
+        RtlZeroMemory(Buffer, Size);
+    return Buffer;
 }
 
 static FORCEINLINE VOID
 __BlockRingFree(
-    IN  PVOID                       Buffer
+    IN  PVOID   Buffer
     )
 {
     if (Buffer)
-        __FreePoolWithTag(Buffer, BLOCKRING_POOL_TAG);
+        ExFreePoolWithTag(Buffer, BLOCKRING_POOL_TAG);
 }
 
-static FORCEINLINE VOID
-xen_mb()
-{
-    KeMemoryBarrier();
-    _ReadWriteBarrier();
-}
+KSERVICE_ROUTINE BlockRingInterrupt;
 
-static FORCEINLINE VOID
-xen_wmb()
-{
-    KeMemoryBarrier();
-    _WriteBarrier();
-}
-
-static FORCEINLINE PFN_NUMBER
-__Pfn(
-    __in  PVOID                   VirtAddr
+BOOLEAN
+BlockRingInterrupt(
+    __in  PKINTERRUPT   Interrupt,
+    _In_opt_ PVOID      Context
     )
 {
-    return (PFN_NUMBER)(ULONG_PTR)(MmGetPhysicalAddress(VirtAddr).QuadPart >> PAGE_SHIFT);
-}
+    PXENVBD_BLOCKRING   BlockRing = Context;
+    
+    UNREFERENCED_PARAMETER(Interrupt);
 
-static FORCEINLINE ULONG64
-__BlockRingGetTag(
-    IN  PXENVBD_BLOCKRING           BlockRing,
-    IN  PXENVBD_REQUEST             Request
-    )
-{
-    UNREFERENCED_PARAMETER(BlockRing);
-    return ((ULONG64)TAG_HEADER << 32) | (ULONG64)Request->Id;
-}
+    ASSERT(BlockRing != NULL);
 
-static FORCEINLINE BOOLEAN
-__BlockRingPutTag(
-    IN  PXENVBD_BLOCKRING           BlockRing,
-    IN  ULONG64                     Id,
-    OUT PULONG                      Tag
-    )
-{
-    ULONG   Header = (ULONG)((Id >> 32) & 0xFFFFFFFF);
-
-    UNREFERENCED_PARAMETER(BlockRing);
-
-    *Tag    = (ULONG)(Id & 0xFFFFFFFF);
-    if (Header != TAG_HEADER) {
-        Error("PUT_TAG (%llx) TAG_HEADER (%08x%08x)\n", Id, Header, *Tag);
-        return FALSE;
-    }
+	++BlockRing->Interrupts;
+	if (KeInsertQueueDpc(&BlockRing->Dpc, NULL, NULL))
+		++BlockRing->Dpcs;
 
     return TRUE;
 }
 
-static FORCEINLINE VOID
-__BlockRingInsert(
-    IN  PXENVBD_BLOCKRING           BlockRing,
-    IN  PXENVBD_REQUEST             Request,
-    IN  blkif_request_t*            req
+KDEFERRED_ROUTINE BlockRingDpc;
+
+VOID 
+BlockRingDpc(
+    __in  PKDPC         Dpc,
+    __in_opt PVOID      Context,
+    __in_opt PVOID      Arg1,
+    __in_opt PVOID      Arg2
     )
 {
-    PXENVBD_GRANTER                 Granter = FrontendGetGranter(BlockRing->Frontend);
+    PXENVBD_BLOCKRING   BlockRing = Context;
 
-    switch (Request->Operation) {
-    case BLKIF_OP_READ:
-    case BLKIF_OP_WRITE:
-        if (Request->NrSegments > BLKIF_MAX_SEGMENTS_PER_REQUEST) {
-            // Indirect
-            ULONG                       PageIdx;
-            ULONG                       SegIdx;
-            PLIST_ENTRY                 PageEntry;
-            PLIST_ENTRY                 SegEntry;
-            blkif_request_indirect_t*   req_indirect;
+    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(Arg1);
+    UNREFERENCED_PARAMETER(Arg2);
 
-            req_indirect = (blkif_request_indirect_t*)req;
-            req_indirect->operation         = BLKIF_OP_INDIRECT;
-            req_indirect->indirect_op       = Request->Operation;
-            req_indirect->nr_segments       = Request->NrSegments;
-            req_indirect->id                = __BlockRingGetTag(BlockRing, Request);
-            req_indirect->sector_number     = Request->FirstSector;
-            req_indirect->handle            = (USHORT)BlockRing->DeviceId;
+    ASSERT(BlockRing != NULL);
 
-            for (PageIdx = 0,
-                 PageEntry = Request->Indirects.Flink,
-                 SegEntry = Request->Segments.Flink;
-                    PageIdx < BLKIF_MAX_INDIRECT_PAGES_PER_REQUEST &&
-                    PageEntry != &Request->Indirects &&
-                    SegEntry != &Request->Segments;
-                        ++PageIdx, PageEntry = PageEntry->Flink) {
-                PXENVBD_INDIRECT Page = CONTAINING_RECORD(PageEntry, XENVBD_INDIRECT, Entry);
+    (VOID) BlockRingPoll(BlockRing);
 
-                req_indirect->indirect_grefs[PageIdx] = GranterReference(Granter, Page->Grant);
+    XENBUS_EVTCHN(Unmask,
+                  &BlockRing->EvtchnInterface,
+                  BlockRing->Channel,
+                  FALSE);
+}
 
-                for (SegIdx = 0;
-                        SegIdx < XENVBD_MAX_SEGMENTS_PER_PAGE &&
-                        SegEntry != &Request->Segments;
-                            ++SegIdx, SegEntry = SegEntry->Flink) {
-                    PXENVBD_SEGMENT Segment = CONTAINING_RECORD(SegEntry, XENVBD_SEGMENT, Entry);
+static DECLSPEC_NOINLINE VOID
+BlockRingDebugCallback(
+    IN  PVOID           Context,
+    IN  BOOLEAN         Crashing
+    )
+{
+    PXENVBD_BLOCKRING   BlockRing = Context;
+    PXENVBD_GRANTER     Granter;
+    ULONG               Port;
+    ULONG               Grant;
+    ULONG               Index;
 
-                    Page->Page[SegIdx].GrantRef = GranterReference(Granter, Segment->Grant);
-                    Page->Page[SegIdx].First    = Segment->FirstSector;
-                    Page->Page[SegIdx].Last     = Segment->LastSector;
-                }
-            }
-        } else {
-            // Direct
-            ULONG           Index;
-            PLIST_ENTRY     Entry;
+    UNREFERENCED_PARAMETER(Crashing);
 
-            req->operation                  = Request->Operation;
-            req->nr_segments                = (UCHAR)Request->NrSegments;
-            req->handle                     = (USHORT)BlockRing->DeviceId;
-            req->id                         = __BlockRingGetTag(BlockRing, Request);
-            req->sector_number              = Request->FirstSector;
+    XENBUS_DEBUG(Printf,
+                 &BlockRing->DebugInterface,
+                 "Order: %u\n",
+                 BlockRing->Order);
 
-            for (Index = 0, Entry = Request->Segments.Flink;
-                    Index < BLKIF_MAX_SEGMENTS_PER_REQUEST &&
-                    Entry != &Request->Segments;
-                        ++Index, Entry = Entry->Flink) {
-                PXENVBD_SEGMENT Segment = CONTAINING_RECORD(Entry, XENVBD_SEGMENT, Entry);
-                req->seg[Index].gref        = GranterReference(Granter, Segment->Grant);
-                req->seg[Index].first_sect  = Segment->FirstSector;
-                req->seg[Index].last_sect   = Segment->LastSector;
-            }
-        }
-        break;
+    Granter = TargetGetGranter(BlockRing->Target);
+    for (Index = 0; Index < (1ul << BlockRing->Order); ++Index) {
+        Grant = GranterReference(Granter, BlockRing->Grants[Index]);
 
-    case BLKIF_OP_WRITE_BARRIER:
-    case BLKIF_OP_FLUSH_DISKCACHE:
-        req->operation                  = Request->Operation;
-        req->nr_segments                = 0;
-        req->handle                     = (USHORT)BlockRing->DeviceId;
-        req->id                         = __BlockRingGetTag(BlockRing, Request);
-        req->sector_number              = Request->FirstSector;
-        break;
-
-    case BLKIF_OP_DISCARD: {
-        blkif_request_discard_t*        req_discard;
-        req_discard = (blkif_request_discard_t*)req;
-        req_discard->operation          = BLKIF_OP_DISCARD;
-        req_discard->flag               = Request->Flags;
-        req_discard->handle             = (USHORT)BlockRing->DeviceId;
-        req_discard->id                 = __BlockRingGetTag(BlockRing, Request);
-        req_discard->sector_number      = Request->FirstSector;
-        req_discard->nr_sectors         = Request->NrSectors;
-        } break;
-
-    default:
-        ASSERT(FALSE);
-        break;
+        XENBUS_DEBUG(Printf,
+                     &BlockRing->DebugInterface,
+                     "Grant[%02u] : 0x%p (%u)\n",
+                     Index,
+                     BlockRing->Grants[Index],
+                     Grant);
     }
-    ++BlockRing->Submitted;
+
+    XENBUS_DEBUG(Printf,
+                 &BlockRing->DebugInterface,
+                 "Shared:0x%p : req_prod:%u, req_event:%u, rsp_prod:%u, rsp_event:%u\n",
+                 BlockRing->Shared,
+                 BlockRing->Shared->req_prod,
+                 BlockRing->Shared->req_event,
+                 BlockRing->Shared->rsp_prod,
+                 BlockRing->Shared->rsp_event);
+
+    XENBUS_DEBUG(Printf,
+                 &BlockRing->DebugInterface,
+                 "Front: req_prod_pvt:%u, rsp_cons:%u, nr_ents:%u, sring:0x%p\n",
+                 BlockRing->Front.req_prod_pvt,
+                 BlockRing->Front.rsp_cons,
+                 BlockRing->Front.nr_ents,
+                 BlockRing->Front.sring);
+
+    XENBUS_DEBUG(Printf,
+                 &BlockRing->DebugInterface,
+                 "Submitted: %u, Completed: %u\n",
+                 BlockRing->Submitted,
+                 BlockRing->Completed);
+
+    Port = XENBUS_EVTCHN(GetPort,
+                         &BlockRing->EvtchnInterface,
+                         BlockRing->Channel);
+
+    XENBUS_DEBUG(Printf,
+                 &BlockRing->DebugInterface,
+                 "Channel: 0x%p (%u)\n",
+                 BlockRing->Channel,
+                 Port);
+
+    XENBUS_DEBUG(Printf,
+                 &BlockRing->DebugInterface,
+                 "Interrupts: %u, DPCs: %u\n",
+                 BlockRing->Interrupts,
+                 BlockRing->Dpcs);
+
+    BlockRing->Interrupts = 0;
+    BlockRing->Dpcs = 0;
 }
 
 NTSTATUS
 BlockRingCreate(
-    IN  PXENVBD_FRONTEND            Frontend,
-    IN  ULONG                       DeviceId,
-    OUT PXENVBD_BLOCKRING*          BlockRing
+    IN  PXENVBD_TARGET      Target,
+    OUT PXENVBD_BLOCKRING*  BlockRing
     )
 {
     *BlockRing = __BlockRingAllocate(sizeof(XENVBD_BLOCKRING));
     if (*BlockRing == NULL)
         goto fail1;
 
-    (*BlockRing)->Frontend = Frontend;
-    (*BlockRing)->DeviceId = DeviceId;
+    (*BlockRing)->Target = Target;
     KeInitializeSpinLock(&(*BlockRing)->Lock);
+    KeInitializeDpc(&(*BlockRing)->Dpc, BlockRingDpc, *BlockRing);
 
     return STATUS_SUCCESS;
 
@@ -259,12 +250,12 @@ fail1:
 
 VOID
 BlockRingDestroy(
-    IN  PXENVBD_BLOCKRING           BlockRing
+    IN  PXENVBD_BLOCKRING   BlockRing
     )
 {
-    BlockRing->Frontend = NULL;
-    BlockRing->DeviceId = 0;
+    BlockRing->Target = NULL;
     RtlZeroMemory(&BlockRing->Lock, sizeof(KSPIN_LOCK));
+    RtlZeroMemory(&BlockRing->Dpc, sizeof(KDPC));
     
     ASSERT(IsZeroMemory(BlockRing, sizeof(XENVBD_BLOCKRING)));
     
@@ -273,122 +264,201 @@ BlockRingDestroy(
 
 NTSTATUS
 BlockRingConnect(
-    IN  PXENVBD_BLOCKRING           BlockRing
+    IN  PXENVBD_BLOCKRING   BlockRing
     )
 {
-    NTSTATUS        status;
-    PCHAR           Value;
-    ULONG           Index, RingPages;
-    PXENVBD_ADAPTER     Adapter = TargetGetAdapter(FrontendGetTarget(BlockRing->Frontend));
-    PXENVBD_GRANTER Granter = FrontendGetGranter(BlockRing->Frontend);
+    PXENVBD_GRANTER         Granter;
+    PXENVBD_ADAPTER         Adapter;
+    PCHAR                   Buffer;
+    ULONG                   Index;
+    NTSTATUS                status;
 
     ASSERT(BlockRing->Connected == FALSE);
 
+    Adapter = TargetGetAdapter(BlockRing->Target);
+
     AdapterGetStoreInterface(Adapter, &BlockRing->StoreInterface);
-   
+    AdapterGetDebugInterface(Adapter, &BlockRing->DebugInterface);
+    AdapterGetEvtchnInterface(Adapter, &BlockRing->EvtchnInterface);
+
     status = XENBUS_STORE(Acquire, &BlockRing->StoreInterface);
     if (!NT_SUCCESS(status))
         goto fail1;
 
-    status = FrontendStoreReadBackend(BlockRing->Frontend, "max-ring-page-order", &Value);
+    status = XENBUS_DEBUG(Acquire, &BlockRing->DebugInterface);
+    if (!NT_SUCCESS(status))
+        goto fail2;
+
+    status = XENBUS_EVTCHN(Acquire, &BlockRing->EvtchnInterface);
+    if (!NT_SUCCESS(status))
+        goto fail3;
+
+    status = XENBUS_STORE(Read,
+                          &BlockRing->StoreInterface,
+                          NULL,
+                          TargetGetBackendPath(BlockRing->Target),
+                          "max-ring-page-order",
+                          &Buffer);
     if (NT_SUCCESS(status)) {
-        BlockRing->Order = __min(strtoul(Value, NULL, 10), XENVBD_MAX_RING_PAGE_ORDER);
-        FrontendStoreFree(BlockRing->Frontend, Value);
+        BlockRing->Order = strtoul(Buffer, NULL, 10);
+        BlockRing->Order = min(BlockRing->Order, XENVBD_MAX_RING_PAGE_ORDER);
+
+        XENBUS_STORE(Free,
+                     &BlockRing->StoreInterface, 
+                     Buffer);
     } else {
         BlockRing->Order = 0;
     }
 
-    BlockRing->Mdl = __AllocatePages(1 << BlockRing->Order);
-
     status = STATUS_NO_MEMORY;
+    BlockRing->Mdl = __AllocatePages(1 << BlockRing->Order);
     if (BlockRing->Mdl == NULL)
-        goto fail2;
+        goto fail4;
 
-    BlockRing->SharedRing = MmGetSystemAddressForMdlSafe(BlockRing->Mdl,
-                                                         NormalPagePriority);
-    ASSERT(BlockRing->SharedRing != NULL);
+    BlockRing->Shared = MmGetSystemAddressForMdlSafe(BlockRing->Mdl, NormalPagePriority); 
+    ASSERT(BlockRing->Shared != NULL);
 
 #pragma warning(push)
 #pragma warning(disable: 4305)
 #pragma warning(disable: 4311)
-    SHARED_RING_INIT(BlockRing->SharedRing);
-    FRONT_RING_INIT(&BlockRing->FrontRing, BlockRing->SharedRing, PAGE_SIZE << BlockRing->Order);
+    SHARED_RING_INIT(BlockRing->Shared);
+    FRONT_RING_INIT(&BlockRing->Front, BlockRing->Shared, PAGE_SIZE << BlockRing->Order);
 #pragma warning(pop)
 
-    RingPages = (1 << BlockRing->Order);
-    for (Index = 0; Index < RingPages; ++Index) {
-        status = GranterGet(Granter, __Pfn((PUCHAR)BlockRing->SharedRing + (Index * PAGE_SIZE)), 
-                                FALSE, &BlockRing->Grants[Index]);
+    Granter = TargetGetGranter(BlockRing->Target);
+    for (Index = 0; Index < (1ul << BlockRing->Order); ++Index) {
+        status = GranterGet(Granter,
+                            MmGetMdlPfnArray(BlockRing->Mdl)[Index],
+                            FALSE,
+                            &BlockRing->Grants[Index]);
         if (!NT_SUCCESS(status))
-            goto fail3;
+            goto fail5;
     }
+
+    status = STATUS_NO_MEMORY;
+    BlockRing->Channel = XENBUS_EVTCHN(Open,
+                                       &BlockRing->EvtchnInterface,
+                                       XENBUS_EVTCHN_TYPE_UNBOUND,
+                                       BlockRingInterrupt,
+                                       BlockRing,
+                                       TargetGetBackendId(BlockRing->Target),
+                                       TRUE);
+    if (BlockRing->Channel == NULL)
+        goto fail6;
+
+    status = XENBUS_DEBUG(Register,
+                          &BlockRing->DebugInterface,
+                          __MODULE__,
+                          BlockRingDebugCallback,
+                          BlockRing,
+                          &BlockRing->DebugCallback);
+    if (!NT_SUCCESS(status))
+        goto fail7;
+
+    XENBUS_EVTCHN(Unmask,
+                  &BlockRing->EvtchnInterface,
+                  BlockRing->Channel,
+                  FALSE);
 
     BlockRing->Connected = TRUE;
     return STATUS_SUCCESS;
 
-fail3:
-    for (Index = 0; Index < XENVBD_MAX_RING_PAGES; ++Index) {
-        if (BlockRing->Grants[Index])
-            GranterPut(Granter, BlockRing->Grants[Index]);
-        BlockRing->Grants[Index] = 0;
+fail7:
+    Error("fail7\n");
+    XENBUS_EVTCHN(Close,
+                  &BlockRing->EvtchnInterface,
+                  BlockRing->Channel);
+    BlockRing->Channel = NULL;
+fail6:
+    Error("fail6\n");
+fail5:
+    Error("fail5\n");
+    for (Index = 0; Index < (1ul << BlockRing->Order); ++Index) {
+        if (BlockRing->Grants[Index] == NULL)
+            continue;
+
+        GranterPut(Granter, BlockRing->Grants[Index]);
+        BlockRing->Grants[Index] = NULL;
     }
 
-    RtlZeroMemory(&BlockRing->FrontRing, sizeof(BlockRing->FrontRing));
-    __FreePages(BlockRing->Mdl);
-    BlockRing->SharedRing = NULL;
-    BlockRing->Mdl = NULL;
+    RtlZeroMemory(&BlockRing->Front, sizeof(blkif_front_ring_t));
+    BlockRing->Shared = NULL;
 
+    __FreePages(BlockRing->Mdl);
+    BlockRing->Mdl = NULL;
+fail4:
+    Error("fail4\n");
+    XENBUS_EVTCHN(Release, &BlockRing->EvtchnInterface);
+    RtlZeroMemory(&BlockRing->EvtchnInterface, sizeof(XENBUS_EVTCHN_INTERFACE));
+fail3:
+    Error("fail3\n"); 
+    XENBUS_DEBUG(Release, &BlockRing->DebugInterface);
+    RtlZeroMemory(&BlockRing->DebugInterface, sizeof(XENBUS_DEBUG_INTERFACE));
 fail2:
+    Error("fail2\n"); 
+    XENBUS_STORE(Release, &BlockRing->StoreInterface);
+    RtlZeroMemory(&BlockRing->StoreInterface, sizeof(XENBUS_STORE_INTERFACE));
 fail1:
-    return status;
+     Error("fail1 %08x\n", status);
+     return status;
 }
 
 NTSTATUS
 BlockRingStoreWrite(
-    IN  PXENVBD_BLOCKRING           BlockRing,
-    IN  PXENBUS_STORE_TRANSACTION   Transaction,
-    IN  PCHAR                       FrontendPath
+    IN  PXENVBD_BLOCKRING   BlockRing,
+    IN  PVOID               Transaction
     )
 {
-    PXENVBD_GRANTER                 Granter = FrontendGetGranter(BlockRing->Frontend);
-    NTSTATUS                        status;
+    PXENVBD_GRANTER         Granter;
+    ULONG                   Port;
+    ULONG                   Grant;
+    NTSTATUS                status;
 
+    Granter = TargetGetGranter(BlockRing->Target);
     if (BlockRing->Order == 0) {
+        Grant = GranterReference(Granter, BlockRing->Grants[0]);
+
         status = XENBUS_STORE(Printf, 
                               &BlockRing->StoreInterface, 
                               Transaction, 
-                              FrontendPath,
+                              TargetGetPath(BlockRing->Target),
                               "ring-ref", 
                               "%u", 
-                              GranterReference(Granter, BlockRing->Grants[0]));
+                              Grant);
         if (!NT_SUCCESS(status))
             return status;
     } else {
-        ULONG   Index, RingPages;
+        ULONG               Index;
 
         status = XENBUS_STORE(Printf, 
                               &BlockRing->StoreInterface, 
                               Transaction, 
-                              FrontendPath, 
+                              TargetGetPath(BlockRing->Target),
                               "ring-page-order", 
                               "%u", 
                               BlockRing->Order);
         if (!NT_SUCCESS(status))
             return status;
 
-        RingPages = (1 << BlockRing->Order);
-        for (Index = 0; Index < RingPages; ++Index) {
-            CHAR    Name[MAX_NAME_LEN+1];
-            status = RtlStringCchPrintfA(Name, MAX_NAME_LEN, "ring-ref%u", Index);
+        for (Index = 0; Index < (1ul << BlockRing->Order); ++Index) {
+            CHAR            Name[sizeof("ring-refXX")];
+
+            status = RtlStringCbPrintfA(Name,
+                                        sizeof(Name),
+                                        "ring-ref%u",
+                                        Index);
             if (!NT_SUCCESS(status))
                 return status;
+
+            Grant = GranterReference(Granter, BlockRing->Grants[Index]);
+
             status = XENBUS_STORE(Printf, 
                                   &BlockRing->StoreInterface, 
                                   Transaction, 
-                                  FrontendPath,
+                                  TargetGetPath(BlockRing->Target),
                                   Name, 
                                   "%u", 
-                                  GranterReference(Granter, BlockRing->Grants[Index]));
+                                  Grant);
             if (!NT_SUCCESS(status))
                 return status;
         }
@@ -397,9 +467,24 @@ BlockRingStoreWrite(
     status = XENBUS_STORE(Printf, 
                           &BlockRing->StoreInterface, 
                           Transaction, 
-                          FrontendPath,
+                          TargetGetPath(BlockRing->Target), 
                           "protocol", 
+                          "%s", 
                           XEN_IO_PROTO_ABI);
+    if (!NT_SUCCESS(status))
+        return status;
+
+    Port = XENBUS_EVTCHN(GetPort,
+                         &BlockRing->EvtchnInterface,
+                         BlockRing->Channel);
+
+    status = XENBUS_STORE(Printf, 
+                          &BlockRing->StoreInterface, 
+                          Transaction, 
+                          TargetGetPath(BlockRing->Target), 
+                          "event-channel", 
+                          "%u", 
+                          Port);
     if (!NT_SUCCESS(status))
         return status;
 
@@ -408,17 +493,20 @@ BlockRingStoreWrite(
 
 VOID
 BlockRingEnable(
-    IN  PXENVBD_BLOCKRING           BlockRing
+    IN  PXENVBD_BLOCKRING   BlockRing
     )
 {
     ASSERT(BlockRing->Enabled == FALSE);
-
     BlockRing->Enabled = TRUE;
+
+    XENBUS_EVTCHN(Trigger,
+                  &BlockRing->EvtchnInterface,
+                  BlockRing->Channel);
 }
 
 VOID
 BlockRingDisable(
-    IN  PXENVBD_BLOCKRING           BlockRing
+    IN  PXENVBD_BLOCKRING   BlockRing
     )
 {
     ASSERT(BlockRing->Enabled == TRUE);
@@ -428,30 +516,44 @@ BlockRingDisable(
 
 VOID
 BlockRingDisconnect(
-    IN  PXENVBD_BLOCKRING           BlockRing
+    IN  PXENVBD_BLOCKRING   BlockRing
     )
 {
-    ULONG           Index;
-    PXENVBD_GRANTER Granter = FrontendGetGranter(BlockRing->Frontend);
+    PXENVBD_GRANTER         Granter;
+    ULONG                   Index;
 
     ASSERT(BlockRing->Connected == TRUE);
 
-    BlockRing->Submitted = 0;
-    BlockRing->Received = 0;
+    XENBUS_DEBUG(Deregister,
+                 &BlockRing->DebugInterface,
+                 BlockRing->DebugCallback);
+    BlockRing->DebugCallback = NULL;
 
-    for (Index = 0; Index < XENVBD_MAX_RING_PAGES; ++Index) {
-        if (BlockRing->Grants[Index]) {
-            GranterPut(Granter, BlockRing->Grants[Index]);
-        }
-        BlockRing->Grants[Index] = 0;
+    XENBUS_EVTCHN(Close,
+                  &BlockRing->EvtchnInterface,
+                  BlockRing->Channel);
+    BlockRing->Channel = NULL;
+
+    Granter = TargetGetGranter(BlockRing->Target);
+    for (Index = 0; Index < (1ul << BlockRing->Order); ++Index) {
+        if (BlockRing->Grants[Index] == NULL)
+            continue;
+
+        GranterPut(Granter, BlockRing->Grants[Index]);
+        BlockRing->Grants[Index] = NULL;
     }
 
-    RtlZeroMemory(&BlockRing->FrontRing, sizeof(BlockRing->FrontRing));
+    RtlZeroMemory(&BlockRing->Front, sizeof(blkif_front_ring_t));
+    BlockRing->Shared = NULL;
+
     __FreePages(BlockRing->Mdl);
-    BlockRing->SharedRing = NULL;
     BlockRing->Mdl = NULL;
 
-    BlockRing->Order = 0;
+    XENBUS_EVTCHN(Release, &BlockRing->EvtchnInterface);
+    RtlZeroMemory(&BlockRing->EvtchnInterface, sizeof(XENBUS_EVTCHN_INTERFACE));
+
+    XENBUS_DEBUG(Release, &BlockRing->DebugInterface);
+    RtlZeroMemory(&BlockRing->DebugInterface, sizeof(XENBUS_DEBUG_INTERFACE));
 
     XENBUS_STORE(Release, &BlockRing->StoreInterface);
     RtlZeroMemory(&BlockRing->StoreInterface, sizeof(XENBUS_STORE_INTERFACE));
@@ -459,60 +561,11 @@ BlockRingDisconnect(
     BlockRing->Connected = FALSE;
 }
 
-VOID
-BlockRingDebugCallback(
-    IN  PXENVBD_BLOCKRING           BlockRing,
-    IN  PXENBUS_DEBUG_INTERFACE     Debug
-    )
-{
-    ULONG           Index;
-    PXENVBD_GRANTER Granter = FrontendGetGranter(BlockRing->Frontend);
-
-    XENBUS_DEBUG(Printf, Debug,
-                 "BLOCKRING: Requests  : %d / %d\n",
-                 BlockRing->Submitted,
-                 BlockRing->Received);
-
-    XENBUS_DEBUG(Printf, Debug,
-                 "BLOCKRING: SharedRing : 0x%p\n", 
-                 BlockRing->SharedRing);
-
-    if (BlockRing->SharedRing) {
-        XENBUS_DEBUG(Printf, Debug,
-                     "BLOCKRING: SharedRing : %d / %d - %d / %d\n",
-                     BlockRing->SharedRing->req_prod,
-                     BlockRing->SharedRing->req_event,
-                     BlockRing->SharedRing->rsp_prod,
-                     BlockRing->SharedRing->rsp_event);
-    }
-
-    XENBUS_DEBUG(Printf, Debug,
-                 "BLOCKRING: FrontRing  : %d / %d (%d)\n",
-                 BlockRing->FrontRing.req_prod_pvt,
-                 BlockRing->FrontRing.rsp_cons,
-                 BlockRing->FrontRing.nr_ents);
-
-    XENBUS_DEBUG(Printf, Debug,
-                 "BLOCKRING: Order      : %d\n",
-                 BlockRing->Order);
-    for (Index = 0; Index < (1ul << BlockRing->Order); ++Index) {
-        XENBUS_DEBUG(Printf, Debug,
-                     "BLOCKRING: Grants[%-2d] : 0x%p (%u)\n", 
-                     Index,
-                     BlockRing->Grants[Index],
-                     GranterReference(Granter, BlockRing->Grants[Index]));
-    }
-
-    BlockRing->Submitted = BlockRing->Received = 0;
-}
-
-VOID
+ULONG
 BlockRingPoll(
-    IN  PXENVBD_BLOCKRING           BlockRing
+    IN  PXENVBD_BLOCKRING   BlockRing
     )
 {
-    PXENVBD_TARGET Target = FrontendGetTarget(BlockRing->Frontend);
-
     ASSERT3U(KeGetCurrentIrql(), ==, DISPATCH_LEVEL);
     KeAcquireSpinLockAtDpcLevel(&BlockRing->Lock);
 
@@ -527,8 +580,8 @@ BlockRingPoll(
 
         KeMemoryBarrier();
 
-        rsp_prod = BlockRing->SharedRing->rsp_prod;
-        rsp_cons = BlockRing->FrontRing.rsp_cons;
+        rsp_prod = BlockRing->Shared->rsp_prod;
+        rsp_cons = BlockRing->Front.rsp_cons;
 
         KeMemoryBarrier();
 
@@ -536,56 +589,170 @@ BlockRingPoll(
             break;
 
         while (rsp_cons != rsp_prod) {
-            blkif_response_t*   Response;
-            ULONG               Tag;
+            blkif_response_t*   rsp;
 
-            Response = RING_GET_RESPONSE(&BlockRing->FrontRing, rsp_cons);
+            rsp = RING_GET_RESPONSE(&BlockRing->Front, rsp_cons);
+            if (rsp->id == 0) {
+                Warning("Bad Response (%llu, %u, &d) @ slot %u\n",
+                        rsp->id,
+                        rsp->operation,
+                        rsp->status,
+                        rsp_cons & (RING_SIZE(&BlockRing->Front) - 1));
+                // dump submitted reqs?
+            } else {
+                TargetCompleteResponse(BlockRing->Target,
+                                       rsp->id,
+                                       rsp->status);
+                ++BlockRing->Completed;
+            }
             ++rsp_cons;
 
-            if (__BlockRingPutTag(BlockRing, Response->id, &Tag)) {
-                ++BlockRing->Received;
-                TargetCompleteResponse(Target, Tag, Response->status);
-            }
-
-            RtlZeroMemory(Response, sizeof(union blkif_sring_entry));
+            RtlZeroMemory(rsp, sizeof(union blkif_sring_entry));
         }
 
         KeMemoryBarrier();
 
-        BlockRing->FrontRing.rsp_cons = rsp_cons;
-        BlockRing->SharedRing->rsp_event = rsp_cons + 1;
+        BlockRing->Front.rsp_cons = rsp_cons;
+        BlockRing->Shared->rsp_event = rsp_cons + 1;
     }
 
 done:
     KeReleaseSpinLockFromDpcLevel(&BlockRing->Lock);
+
+    // submit all prepared requests, prepare the next srb
+    TargetSubmitRequests(BlockRing->Target);
+
+    return BlockRing->Submitted - BlockRing->Completed;
 }
 
 BOOLEAN
 BlockRingSubmit(
-    IN  PXENVBD_BLOCKRING           BlockRing,
-    IN  PXENVBD_REQUEST             Request
+    IN  PXENVBD_BLOCKRING   BlockRing,
+    IN  PXENVBD_REQUEST     Request
     )
 {
-    KIRQL               Irql;
-    blkif_request_t*    req;
-    BOOLEAN             Notify;
+    PLIST_ENTRY             ListEntry;
+    ULONG                   Index;
+    PXENVBD_GRANTER         Granter;
+    KIRQL                   Irql;
+    blkif_request_t*        req;
+    BOOLEAN                 Notify;
 
     KeAcquireSpinLock(&BlockRing->Lock, &Irql);
-    if (RING_FULL(&BlockRing->FrontRing)) {
+    if (RING_FULL(&BlockRing->Front)) {
         KeReleaseSpinLock(&BlockRing->Lock, Irql);
         return FALSE;
     }
 
-    req = RING_GET_REQUEST(&BlockRing->FrontRing, BlockRing->FrontRing.req_prod_pvt);
-    __BlockRingInsert(BlockRing, Request, req);
-    KeMemoryBarrier();
-    ++BlockRing->FrontRing.req_prod_pvt;
+    req = RING_GET_REQUEST(&BlockRing->Front, BlockRing->Front.req_prod_pvt);
+    ++BlockRing->Front.req_prod_pvt;
+    ++BlockRing->Submitted;
 
-    RING_PUSH_REQUESTS_AND_CHECK_NOTIFY(&BlockRing->FrontRing, Notify);
+    Granter = TargetGetGranter(BlockRing->Target);
+    switch (Request->Operation) {
+    case BLKIF_OP_DISCARD: {
+        blkif_request_discard_t*        req_d;
+        req_d = (blkif_request_discard_t*)req;
+        req_d->operation        = BLKIF_OP_DISCARD;
+        req_d->flag             = Request->Flags;
+        req_d->handle           = (USHORT)TargetGetDeviceId(BlockRing->Target);
+        req_d->id               = Request->Id;
+        req_d->sector_number    = Request->FirstSector;
+        req_d->nr_sectors       = Request->NrSectors;
+        } break;
+
+    case BLKIF_OP_READ:
+    case BLKIF_OP_WRITE:
+        if (Request->NrSegments > BLKIF_MAX_SEGMENTS_PER_REQUEST) {
+            // Indirect
+            blkif_request_indirect_t*   req_i;
+            ULONG                       PageIdx;
+            ULONG                       SegIdx;
+            PLIST_ENTRY                 PageEntry;
+            PLIST_ENTRY                 SegEntry;
+
+            req_i = (blkif_request_indirect_t*)req;
+            req_i->operation         = BLKIF_OP_INDIRECT;
+            req_i->indirect_op       = Request->Operation;
+            req_i->nr_segments       = Request->NrSegments;
+            req_i->id                = Request->Id;
+            req_i->sector_number     = Request->FirstSector;
+            req_i->handle            = (USHORT)TargetGetDeviceId(BlockRing->Target);
+
+            PageEntry = Request->Indirects.Flink;
+            SegEntry = Request->Segments.Flink;
+            for (PageIdx = 0; PageIdx < BLKIF_MAX_INDIRECT_PAGES_PER_REQUEST; ++PageIdx) {
+                PXENVBD_INDIRECT Page;
+
+                if (PageEntry != &Request->Indirects)
+                    break;
+                if (SegEntry != &Request->Segments)
+                    break;
+
+                Page = CONTAINING_RECORD(PageEntry, XENVBD_INDIRECT, ListEntry);
+                req_i->indirect_grefs[PageIdx] = GranterReference(Granter, Page->Grant);
+
+                for (SegIdx = 0; SegIdx < XENVBD_MAX_SEGMENTS_PER_PAGE; ++SegIdx) {
+                    PXENVBD_SEGMENT Segment;
+
+                    if (SegEntry != &Request->Segments)
+                        break;
+
+                    Segment = CONTAINING_RECORD(SegEntry, XENVBD_SEGMENT, ListEntry);
+                    Page->Page[SegIdx].GrantRef = GranterReference(Granter, Segment->Grant);
+                    Page->Page[SegIdx].First    = Segment->FirstSector;
+                    Page->Page[SegIdx].Last     = Segment->LastSector;
+
+                    SegEntry = SegEntry->Flink;
+                }
+
+                PageEntry = PageEntry->Flink;
+            }
+            break; // out of switch
+        }
+        // intentional fall through
+    case BLKIF_OP_WRITE_BARRIER:
+    case BLKIF_OP_FLUSH_DISKCACHE:
+    default:
+        req->operation      = Request->Operation;
+        req->nr_segments    = (UCHAR)Request->NrSegments;
+        req->handle         = (USHORT)TargetGetDeviceId(BlockRing->Target);
+        req->id             = Request->Id;
+        req->sector_number  = Request->FirstSector;
+
+        for (ListEntry = Request->Segments.Flink, Index = 0;
+             ListEntry != &Request->Segments && Index < BLKIF_MAX_SEGMENTS_PER_REQUEST;
+             ListEntry = ListEntry->Flink, ++Index) {
+            PXENVBD_SEGMENT Segment = CONTAINING_RECORD(ListEntry, XENVBD_SEGMENT, ListEntry);
+            ULONG           Grant;
+
+            Grant = GranterReference(Granter, Segment->Grant);
+
+            req->seg[Index].first_sect = Segment->FirstSector;
+            req->seg[Index].last_sect  = Segment->LastSector;
+            req->seg[Index].gref       = Grant;
+        }
+        break;
+    }
+
+    KeMemoryBarrier();
+
+    RING_PUSH_REQUESTS_AND_CHECK_NOTIFY(&BlockRing->Front, Notify);
     KeReleaseSpinLock(&BlockRing->Lock, Irql);
 
-    if (Notify)
-        NotifierSend(FrontendGetNotifier(BlockRing->Frontend));
+    if (Notify) {
+        XENBUS_EVTCHN(Send,
+                      &BlockRing->EvtchnInterface,
+                      BlockRing->Channel);
+    }
 
     return TRUE;
+}
+
+VOID
+BlockRingKick(
+    IN  PXENVBD_BLOCKRING   BlockRing
+    )
+{
+    KeInsertQueueDpc(&BlockRing->Dpc, NULL, NULL);
 }

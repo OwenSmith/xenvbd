@@ -111,7 +111,8 @@ __AdapterFree(
     IN  PVOID   Buffer
     )
 {
-    ExFreePoolWithTag(Buffer, ADAPTER_POOL_TAG);
+    if (Buffer)
+        ExFreePoolWithTag(Buffer, ADAPTER_POOL_TAG);
 }
 
 static FORCEINLINE PANSI_STRING
@@ -449,7 +450,7 @@ __AdapterEnumerate(
             }
         }
 
-        if (Missing && !TargetIsMissing(Target)) {
+        if (Missing && !TargetGetMissing(Target)) {
             TargetSetMissing(Target, "Device Disappeared");
             if (TargetGetDevicePnpState(Target) == Present)
                 TargetSetDevicePnpState(Target, Deleted);
@@ -480,7 +481,7 @@ __AdapterEnumerate(
             continue;
 
         status = TargetCreate(Adapter,
-                              Device->Buffer,
+                              Device,
                               &Target);
         if (status == STATUS_RETRY)
             NeedReboot = TRUE;
@@ -881,7 +882,6 @@ AdapterDebugCallback(
     )
 {
     PXENVBD_ADAPTER Adapter = Context;
-    ULONG           TargetId;
 
     XENBUS_DEBUG(Printf, 
                  &Adapter->DebugInterface,
@@ -911,24 +911,6 @@ AdapterDebugCallback(
                  Adapter->Completed);
 
     BufferDebugCallback(&Adapter->DebugInterface);
-    
-    for (TargetId = 0; TargetId < XENVBD_MAX_TARGETS; ++TargetId) {
-        // no need to use AdapterGetTarget (which is locked at DISPATCH) as called at HIGH_LEVEL
-        PXENVBD_TARGET Target = Adapter->TargetList[TargetId];
-        if (Target == NULL)
-            continue;
-
-        XENBUS_DEBUG(Printf, &Adapter->DebugInterface,
-                     "ADAPTER: ====> Target[%-3d]    : 0x%p\n",                  
-                     TargetId, Target);
-
-        // call Target's debug callback directly
-        TargetDebugCallback(Target, &Adapter->DebugInterface);
-
-        XENBUS_DEBUG(Printf, &Adapter->DebugInterface,
-                     "ADAPTER: <==== Target[%-3d]    : 0x%p\n",                  
-                     TargetId, Target);
-    }
 }
 
 static NTSTATUS
@@ -1476,13 +1458,27 @@ __AdapterSrbPnp(
     IN  PSCSI_PNP_REQUEST_BLOCK Srb
     )
 {
-    if (!(Srb->SrbPnPFlags & SRB_PNP_FLAGS_ADAPTER_REQUEST)) {
-        PXENVBD_TARGET          Target;
+    PXENVBD_TARGET              Target;
 
-        Target = AdapterGetTarget(Adapter, Srb->TargetId);
-        if (Target) {
-            TargetSrbPnp(Target, Srb);
-        }
+    if (Srb->SrbPnPFlags & SRB_PNP_FLAGS_ADAPTER_REQUEST)
+        return;
+
+    Target = AdapterGetTarget(Adapter, Srb->TargetId);
+    if (Target == NULL)
+        return;
+
+    switch (Srb->PnPAction) {
+    case StorQueryCapabilities: {
+        PSTOR_DEVICE_CAPABILITIES DeviceCaps = Srb->DataBuffer;
+
+        DeviceCaps->Removable       = TargetGetRemovable(Target);
+        DeviceCaps->EjectSupported  = TargetGetRemovable(Target);
+        DeviceCaps->SurpriseRemovalOK = TargetGetRemovable(Target);
+        DeviceCaps->UniqueID = 1;
+
+        } break;
+    default:
+        break;
     }
 }
 

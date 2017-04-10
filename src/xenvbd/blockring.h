@@ -32,66 +32,64 @@
 #ifndef _XENVBD_BLOCKRING_H
 #define _XENVBD_BLOCKRING_H
 
+#include <ntddk.h>
+
 typedef struct _XENVBD_BLOCKRING XENVBD_BLOCKRING, *PXENVBD_BLOCKRING;
 
-#include "frontend.h"
-#include <debug_interface.h>
-#include <store_interface.h>
+#include "target.h"
+#include "srbext.h"
 
 extern NTSTATUS
 BlockRingCreate(
-    IN  PXENVBD_FRONTEND            Frontend,
-    IN  ULONG                       DeviceId,
-    OUT PXENVBD_BLOCKRING*          BlockRing
+    IN  PXENVBD_TARGET      Target,
+    OUT PXENVBD_BLOCKRING*  BlockRing
     );
 
 extern VOID
 BlockRingDestroy(
-    IN  PXENVBD_BLOCKRING           BlockRing
+    IN  PXENVBD_BLOCKRING   BlockRing
     );
 
 extern NTSTATUS
 BlockRingConnect(
-    IN  PXENVBD_BLOCKRING           BlockRing
+    IN  PXENVBD_BLOCKRING   BlockRing
     );
 
 extern NTSTATUS
 BlockRingStoreWrite(
-    IN  PXENVBD_BLOCKRING           BlockRing,
-    IN  PXENBUS_STORE_TRANSACTION   Transaction,
-    IN  PCHAR                       FrontendPath
+    IN  PXENVBD_BLOCKRING   BlockRing,
+    IN  PVOID               Transaction
     );
 
 extern VOID
 BlockRingEnable(
-    IN  PXENVBD_BLOCKRING           BlockRing
+    IN  PXENVBD_BLOCKRING   BlockRing
     );
 
 extern VOID
 BlockRingDisable(
-    IN  PXENVBD_BLOCKRING           BlockRing
+    IN  PXENVBD_BLOCKRING   BlockRing
     );
 
 extern VOID
 BlockRingDisconnect(
-    IN  PXENVBD_BLOCKRING           BlockRing
+    IN  PXENVBD_BLOCKRING   BlockRing
     );
 
-extern VOID
-BlockRingDebugCallback(
-    IN  PXENVBD_BLOCKRING           BlockRing,
-    IN  PXENBUS_DEBUG_INTERFACE     Debug
-    );
-
-extern VOID
+extern ULONG
 BlockRingPoll(
-    IN  PXENVBD_BLOCKRING           BlockRing
+    IN  PXENVBD_BLOCKRING   BlockRing
     );
 
 extern BOOLEAN
 BlockRingSubmit(
-    IN  PXENVBD_BLOCKRING           BlockRing,
-    IN  PXENVBD_REQUEST             Request
+    IN  PXENVBD_BLOCKRING   BlockRing,
+    IN  PXENVBD_REQUEST     Request
+    );
+
+extern VOID
+BlockRingKick(
+    IN  PXENVBD_BLOCKRING   BlockRing
     );
 
 #endif // _XENVBD_BLOCKRING_H

@@ -37,25 +37,91 @@
 #include <xencdb.h>
 #include <names.h>
 #include <store_interface.h>
-#include <evtchn_interface.h>
-#include <gnttab_interface.h>
 #include <debug_interface.h>
 #include <suspend_interface.h>
 
 #include "target.h"
 #include "driver.h"
 #include "adapter.h"
-#include "frontend.h"
-#include "queue.h"
+#include "thread.h"
 #include "srbext.h"
 #include "buffer.h"
-#include "pdoinquiry.h"
+#include "granter.h"
+#include "blockring.h"
 
 #include "util.h"
 #include "debug.h"
 #include "assert.h"
 
-#define XENVBD_MAX_QUEUE_DEPTH          (254)
+#define TARGET_POOL_TAG         'raTX'
+#define REQUEST_POOL_TAG        'qeRX'
+#define SEGMENT_POOL_TAG        'geSX'
+#define INDIRECT_POOL_TAG       'dnIX'
+#define XENVBD_MAX_QUEUE_DEPTH  (254)
+
+typedef enum _XENVBD_STATE {
+    XENVBD_STATE_INVALID,
+    XENVBD_INITIALIZED, // -> { CLOSED }
+    XENVBD_CLOSING,     // -> { CLOSED }
+    XENVBD_CLOSED,      // -> { PREPARED }
+    XENVBD_PREPARED,    // -> { CLOSING, CONNECTED }
+    XENVBD_CONNECTED,   // -> { ENABLED, CLOSING }
+    XENVBD_ENABLED      // -> { CLOSING }
+} XENVBD_STATE;
+
+struct _XENVBD_TARGET {
+    PXENVBD_ADAPTER             Adapter;
+    PDEVICE_OBJECT              DeviceObject;
+    DEVICE_PNP_STATE            PrevPnpState;
+    DEVICE_PNP_STATE            DevicePnpState;
+    DEVICE_POWER_STATE          DevicePowerState;
+    XENVBD_STATE                State;
+    KSPIN_LOCK                  StateLock;
+    KSPIN_LOCK                  QueueLock;
+    BOOLEAN                     Missing;
+    PXENVBD_GRANTER             Granter;
+    PXENVBD_BLOCKRING           BlockRing;
+
+    ULONG                       DeviceId;
+    ULONG                       TargetId;
+    PCHAR                       Path;
+    PCHAR                       TargetPath;
+    PCHAR                       BackendPath;
+    USHORT                      BackendId;
+
+    BOOLEAN                     DeviceUsage[4];
+    ULONG64                     SectorCount;
+    ULONG                       SectorSize;
+    ULONG                       PhysicalSectorSize;
+    ULONG                       DiskInfo;
+    BOOLEAN                     Removable;
+    BOOLEAN                     FeatureBarrier;
+    BOOLEAN                     FeatureFlush;
+    BOOLEAN                     FeatureDiscard;
+    BOOLEAN                     DiscardSecure;
+    ULONG                       DiscardAlignment;
+    ULONG                       DiscardGranularity;
+    ULONG                       FeatureIndirect;
+
+    XENBUS_DEBUG_INTERFACE      DebugInterface;
+    XENBUS_SUSPEND_INTERFACE    SuspendInterface;
+    XENBUS_STORE_INTERFACE      StoreInterface;
+
+    PXENBUS_DEBUG_CALLBACK      DebugCallback;
+    PXENBUS_SUSPEND_CALLBACK    SuspendCallback;
+
+    PXENVBD_THREAD              BackendThread;
+    PXENBUS_STORE_WATCH         BackendWatch;
+
+    LIST_ENTRY                  Fresh;
+    LIST_ENTRY                  Prepared;
+    LIST_ENTRY                  Submitted;
+    LIST_ENTRY                  Shutdown;
+
+    NPAGED_LOOKASIDE_LIST       RequestList;
+    NPAGED_LOOKASIDE_LIST       SegmentList;
+    NPAGED_LOOKASIDE_LIST       IndirectList;
+};
 
 typedef struct _XENVBD_SG_LIST {
     // SGList from SRB
@@ -69,737 +135,15 @@ typedef struct _XENVBD_SG_LIST {
     ULONG                       Length;
 } XENVBD_SG_LIST, *PXENVBD_SG_LIST;
 
-#define TARGET_SIGNATURE           'odpX'
-
-typedef struct _XENVBD_LOOKASIDE {
-    KEVENT                      Empty;
-    LONG                        Used;
-    LONG                        Max;
-    ULONG                       Failed;
-    ULONG                       Size;
-    NPAGED_LOOKASIDE_LIST       List;
-} XENVBD_LOOKASIDE, *PXENVBD_LOOKASIDE;
-
-struct _XENVBD_TARGET {
-    ULONG                       Signature;
-    PXENVBD_ADAPTER                 Adapter;
-    PDEVICE_OBJECT              DeviceObject;
-    DEVICE_PNP_STATE            DevicePnpState;
-    DEVICE_PNP_STATE            PrevPnpState;
-    DEVICE_POWER_STATE          DevicePowerState;
-    KSPIN_LOCK                  Lock;
-
-    // Frontend (Ring, includes XenBus interfaces)
-    PXENVBD_FRONTEND            Frontend;
-
-    // State
-    LONG                        Paused;
-
-    // Eject
-    BOOLEAN                     WrittenEjected;
-    BOOLEAN                     EjectRequested;
-    BOOLEAN                     EjectPending;
-    BOOLEAN                     Missing;
-    const CHAR*                 Reason;
-
-    // SRBs
-    XENVBD_LOOKASIDE            RequestList;
-    XENVBD_LOOKASIDE            SegmentList;
-    XENVBD_LOOKASIDE            IndirectList;
-    XENVBD_QUEUE                FreshSrbs;
-    XENVBD_QUEUE                PreparedReqs;
-    XENVBD_QUEUE                SubmittedReqs;
-    XENVBD_QUEUE                ShutdownSrbs;
-    ULONG                       NextTag;
-
-    // Stats - SRB Counts by BLKIF_OP_
-    ULONG                       BlkOpRead;
-    ULONG                       BlkOpWrite;
-    ULONG                       BlkOpIndirectRead;
-    ULONG                       BlkOpIndirectWrite;
-    ULONG                       BlkOpBarrier;
-    ULONG                       BlkOpDiscard;
-    ULONG                       BlkOpFlush;
-    // Stats - Failures
-    ULONG                       FailedMaps;
-    ULONG                       FailedBounces;
-    ULONG                       FailedGrants;
-    // Stats - Segments
-    ULONG64                     SegsGranted;
-    ULONG64                     SegsBounced;
-};
-
-//=============================================================================
-#define TARGET_POOL_TAG            'odPX'
-#define REQUEST_POOL_TAG        'qeRX'
-#define SEGMENT_POOL_TAG        'geSX'
-#define INDIRECT_POOL_TAG       'dnIX'
-
-__checkReturn
-__drv_allocatesMem(mem)
-__bcount(Size)
-static FORCEINLINE PVOID
-#pragma warning(suppress: 28195)
-__TargetAlloc(
-    __in ULONG  Size
-    )
-{
-    return __AllocatePoolWithTag(NonPagedPool, Size, TARGET_POOL_TAG);
-}
-
 static FORCEINLINE VOID
-#pragma warning(suppress: 28197)
-__TargetFree(
-    __in __drv_freesMem(mem) PVOID Buffer
+SGListInit(
+    IN OUT  PXENVBD_SG_LIST     SGList,
+    IN  PVOID                   Adapter,
+    IN  PSCSI_REQUEST_BLOCK     Srb
     )
 {
-    if (Buffer)
-        __FreePoolWithTag(Buffer, TARGET_POOL_TAG);
-}
-
-//=============================================================================
-// Lookasides
-static FORCEINLINE VOID
-__LookasideInit(
-    IN OUT  PXENVBD_LOOKASIDE   Lookaside,
-    IN  ULONG                   Size,
-    IN  ULONG                   Tag
-    )
-{
-    RtlZeroMemory(Lookaside, sizeof(XENVBD_LOOKASIDE));
-    Lookaside->Size = Size;
-    KeInitializeEvent(&Lookaside->Empty, SynchronizationEvent, TRUE);
-    ExInitializeNPagedLookasideList(&Lookaside->List, NULL, NULL, 0,
-                                    Size, Tag, 0);
-}
-
-static FORCEINLINE VOID
-__LookasideTerm(
-    IN  PXENVBD_LOOKASIDE       Lookaside
-    )
-{
-    ASSERT3U(Lookaside->Used, ==, 0);
-    ExDeleteNPagedLookasideList(&Lookaside->List);
-    RtlZeroMemory(Lookaside, sizeof(XENVBD_LOOKASIDE));
-}
-
-static FORCEINLINE PVOID
-__LookasideAlloc(
-    IN  PXENVBD_LOOKASIDE       Lookaside
-    )
-{
-    LONG    Result;
-    PVOID   Buffer;
-
-    Buffer = ExAllocateFromNPagedLookasideList(&Lookaside->List);
-    if (Buffer == NULL) {
-        ++Lookaside->Failed;
-        return NULL;
-    }
-
-    RtlZeroMemory(Buffer, Lookaside->Size);
-    Result = InterlockedIncrement(&Lookaside->Used);
-    ASSERT3S(Result, >, 0);
-    if (Result > Lookaside->Max)
-        Lookaside->Max = Result;
-    KeClearEvent(&Lookaside->Empty);
-
-    return Buffer;
-}
-
-static FORCEINLINE VOID
-__LookasideFree(
-    IN  PXENVBD_LOOKASIDE       Lookaside,
-    IN  PVOID                   Buffer
-    )
-{
-    LONG            Result;
-
-    ExFreeToNPagedLookasideList(&Lookaside->List, Buffer);
-    Result = InterlockedDecrement(&Lookaside->Used);
-    ASSERT3S(Result, >=, 0);
-        
-    if (Result == 0) {
-        KeSetEvent(&Lookaside->Empty, IO_NO_INCREMENT, FALSE);
-    }
-}
-
-static FORCEINLINE VOID
-__LookasideDebug(
-    IN  PXENVBD_LOOKASIDE           Lookaside,
-    IN  PXENBUS_DEBUG_INTERFACE     Debug,
-    IN  PCHAR                       Name
-    )
-{
-    XENBUS_DEBUG(Printf, Debug,
-                 "LOOKASIDE: %s: %u / %u (%u failed)\n",
-                 Name, Lookaside->Used,
-                 Lookaside->Max, Lookaside->Failed);
-
-    Lookaside->Max = Lookaside->Used;
-    Lookaside->Failed = 0;
-}
-
-//=============================================================================
-// Debug
-static FORCEINLINE PCHAR
-__PnpStateName(
-    __in DEVICE_PNP_STATE        State
-    )
-{
-    switch (State) {
-    case Invalid:               return "Invalid";
-    case Present:               return "Present";
-    case Enumerated:            return "Enumerated";
-    case Added:                 return "Added";
-    case Started:               return "Started";
-    case StopPending:           return "StopPending";
-    case Stopped:               return "Stopped";
-    case RemovePending:         return "RemovePending";
-    case SurpriseRemovePending: return "SurpriseRemovePending";
-    case Deleted:               return "Deleted";
-    default:                    return "UNKNOWN";
-    }
-}
-
-DECLSPEC_NOINLINE VOID
-TargetDebugCallback(
-    __in PXENVBD_TARGET Target,
-    __in PXENBUS_DEBUG_INTERFACE DebugInterface
-    )
-{
-    if (Target == NULL || DebugInterface == NULL)
-        return;
-    if (Target->Signature != TARGET_SIGNATURE)
-        return;
-
-    XENBUS_DEBUG(Printf, DebugInterface,
-                 "TARGET: Adapter 0x%p DeviceObject 0x%p\n",
-                 Target->Adapter,
-                 Target->DeviceObject);
-    XENBUS_DEBUG(Printf, DebugInterface,
-                 "TARGET: DevicePnpState %s (%s)\n",
-                 __PnpStateName(Target->DevicePnpState),
-                 __PnpStateName(Target->PrevPnpState));
-    XENBUS_DEBUG(Printf, DebugInterface,
-                 "TARGET: DevicePowerState %s\n",
-                 PowerDeviceStateName(Target->DevicePowerState));
-    XENBUS_DEBUG(Printf, DebugInterface,
-                 "TARGET: %s\n",
-                 Target->Missing ? Target->Reason : "Not Missing");
-
-    XENBUS_DEBUG(Printf, DebugInterface,
-                 "TARGET: BLKIF_OPs: READ=%u WRITE=%u\n",
-                 Target->BlkOpRead, Target->BlkOpWrite);
-    XENBUS_DEBUG(Printf, DebugInterface,
-                 "TARGET: BLKIF_OPs: INDIRECT_READ=%u INDIRECT_WRITE=%u\n",
-                 Target->BlkOpIndirectRead, Target->BlkOpIndirectWrite);
-    XENBUS_DEBUG(Printf, DebugInterface,
-                 "TARGET: BLKIF_OPs: BARRIER=%u DISCARD=%u FLUSH=%u\n",
-                 Target->BlkOpBarrier, Target->BlkOpDiscard, Target->BlkOpFlush);
-    XENBUS_DEBUG(Printf, DebugInterface,
-                 "TARGET: Failed: Maps=%u Bounces=%u Grants=%u\n",
-                 Target->FailedMaps, Target->FailedBounces, Target->FailedGrants);
-    XENBUS_DEBUG(Printf, DebugInterface,
-                 "TARGET: Segments Granted=%llu Bounced=%llu\n",
-                 Target->SegsGranted, Target->SegsBounced);
-
-    __LookasideDebug(&Target->RequestList, DebugInterface, "REQUESTs");
-    __LookasideDebug(&Target->SegmentList, DebugInterface, "SEGMENTs");
-    __LookasideDebug(&Target->IndirectList, DebugInterface, "INDIRECTs");
-
-    QueueDebugCallback(&Target->FreshSrbs,    "Fresh    ", DebugInterface);
-    QueueDebugCallback(&Target->PreparedReqs, "Prepared ", DebugInterface);
-    QueueDebugCallback(&Target->SubmittedReqs, "Submitted", DebugInterface);
-    QueueDebugCallback(&Target->ShutdownSrbs, "Shutdown ", DebugInterface);
-
-    FrontendDebugCallback(Target->Frontend, DebugInterface);
-
-    Target->BlkOpRead = Target->BlkOpWrite = 0;
-    Target->BlkOpIndirectRead = Target->BlkOpIndirectWrite = 0;
-    Target->BlkOpBarrier = Target->BlkOpDiscard = Target->BlkOpFlush = 0;
-    Target->FailedMaps = Target->FailedBounces = Target->FailedGrants = 0;
-    Target->SegsGranted = Target->SegsBounced = 0;
-}
-
-//=============================================================================
-// Power States
-__checkReturn
-static FORCEINLINE BOOLEAN
-TargetSetDevicePowerState(
-    __in PXENVBD_TARGET             Target,
-    __in DEVICE_POWER_STATE      State
-    )
-{
-    KIRQL       Irql;
-    BOOLEAN     Changed = FALSE;
-
-    KeAcquireSpinLock(&Target->Lock, &Irql);
-    if (Target->DevicePowerState != State) {
-        Verbose("Target[%d] : POWER %s to %s\n", TargetGetTargetId(Target), PowerDeviceStateName(Target->DevicePowerState), PowerDeviceStateName(State));
-        Target->DevicePowerState = State;
-        Changed = TRUE;
-    }
-    KeReleaseSpinLock(&Target->Lock, Irql);
-    
-    return Changed;
-}
-
-//=============================================================================
-// PnP States
-FORCEINLINE VOID
-TargetSetMissing(
-    __in PXENVBD_TARGET             Target,
-    __in __nullterminated const CHAR* Reason
-    )
-{
-    KIRQL   Irql;
-
-    ASSERT3P(Reason, !=, NULL);
-
-    KeAcquireSpinLock(&Target->Lock, &Irql);
-    if (Target->Missing) {
-        Verbose("Target[%d] : Already MISSING (%s) when trying to set (%s)\n", TargetGetTargetId(Target), Target->Reason, Reason);
-    } else {
-        Verbose("Target[%d] : MISSING %s\n", TargetGetTargetId(Target), Reason);
-        Target->Missing = TRUE;
-        Target->Reason = Reason;
-    }
-    KeReleaseSpinLock(&Target->Lock, Irql);
-}
-
-__checkReturn
-FORCEINLINE BOOLEAN
-TargetIsMissing(
-    __in PXENVBD_TARGET             Target
-    )
-{
-    KIRQL   Irql;
-    BOOLEAN Missing;
-
-    KeAcquireSpinLock(&Target->Lock, &Irql);
-    Missing = Target->Missing;
-    KeReleaseSpinLock(&Target->Lock, Irql);
-
-    return Missing;
-}
-
-FORCEINLINE const CHAR*
-TargetMissingReason(
-    __in PXENVBD_TARGET            Target
-    )
-{
-    KIRQL       Irql;
-    const CHAR* Reason;
-
-    KeAcquireSpinLock(&Target->Lock, &Irql);
-    Reason = Target->Reason;
-    KeReleaseSpinLock(&Target->Lock, Irql);
-
-    return Reason;
-}
-
-FORCEINLINE VOID
-TargetSetDevicePnpState(
-    __in PXENVBD_TARGET             Target,
-    __in DEVICE_PNP_STATE        State
-    )
-{
-    Verbose("Target[%d] : PNP %s to %s\n",
-            TargetGetTargetId(Target),
-            __PnpStateName(Target->DevicePnpState),
-            __PnpStateName(State));
-
-    if (Target->DevicePnpState == Deleted)
-        return;
-
-    Target->PrevPnpState = Target->DevicePnpState;
-    Target->DevicePnpState = State;
-}
-
-__checkReturn
-FORCEINLINE DEVICE_PNP_STATE
-TargetGetDevicePnpState(
-    __in PXENVBD_TARGET             Target
-    )
-{
-    return Target->DevicePnpState;
-}
-
-static FORCEINLINE VOID
-__TargetRestoreDevicePnpState(
-    __in PXENVBD_TARGET             Target,
-    __in DEVICE_PNP_STATE        State
-    )
-{
-    if (Target->DevicePnpState == State) {
-        Verbose("Target[%d] : PNP %s to %s\n", TargetGetTargetId(Target), __PnpStateName(Target->DevicePnpState), __PnpStateName(Target->PrevPnpState));
-        Target->DevicePnpState = Target->PrevPnpState;
-    }
-}
-
-//=============================================================================
-// Query Methods
-FORCEINLINE ULONG
-TargetGetTargetId(
-    __in PXENVBD_TARGET             Target
-    )
-{
-    ASSERT3P(Target, !=, NULL);
-    return FrontendGetTargetId(Target->Frontend);
-}
-
-ULONG
-TargetGetDeviceId(
-    __in PXENVBD_TARGET             Target
-    )
-{
-    ASSERT3P(Target, !=, NULL);
-    return FrontendGetDeviceId(Target->Frontend);
-}
-
-__checkReturn
-FORCEINLINE PDEVICE_OBJECT
-TargetGetDeviceObject(
-    __in PXENVBD_TARGET             Target
-    )
-{
-    ASSERT3P(Target, !=, NULL);
-    return Target->DeviceObject;
-}
-
-FORCEINLINE VOID
-TargetSetDeviceObject(
-    __in PXENVBD_TARGET             Target,
-    __in PDEVICE_OBJECT          DeviceObject
-    )
-{
-    Verbose("Target[%d] : Setting DeviceObject = 0x%p\n", TargetGetTargetId(Target), DeviceObject);
-
-    ASSERT3P(Target->DeviceObject, ==, NULL);
-    Target->DeviceObject = DeviceObject;
-}
-
-__checkReturn
-FORCEINLINE BOOLEAN
-TargetIsPaused(
-    __in PXENVBD_TARGET             Target
-    )
-{
-    BOOLEAN Paused;
-    KIRQL   Irql;
-
-    KeAcquireSpinLock(&Target->Lock, &Irql);
-    Paused = (Target->Paused > 0);
-    KeReleaseSpinLock(&Target->Lock, Irql);
-    
-    return Paused;
-}
-
-__checkReturn
-FORCEINLINE ULONG
-TargetOutstandingReqs(
-    __in PXENVBD_TARGET             Target
-    )
-{
-    return QueueCount(&Target->SubmittedReqs);
-}
-
-__checkReturn
-FORCEINLINE PXENVBD_ADAPTER
-TargetGetAdapter( 
-    __in PXENVBD_TARGET             Target
-    )
-{
-    return Target->Adapter;
-}
-
-FORCEINLINE ULONG
-TargetSectorSize(
-    __in PXENVBD_TARGET             Target
-    )
-{
-    return FrontendGetDiskInfo(Target->Frontend)->SectorSize;
-}
-
-//=============================================================================
-static PXENVBD_INDIRECT
-TargetGetIndirect(
-    IN  PXENVBD_TARGET             Target
-    )
-{
-    PXENVBD_INDIRECT    Indirect;
-    NTSTATUS            status;
-    PXENVBD_GRANTER     Granter = FrontendGetGranter(Target->Frontend);
-
-    Indirect = __LookasideAlloc(&Target->IndirectList);
-    if (Indirect == NULL)
-        goto fail1;
-
-    RtlZeroMemory(Indirect, sizeof(XENVBD_INDIRECT));
-
-    Indirect->Mdl = __AllocatePage();
-    if (Indirect->Mdl == NULL)
-        goto fail2;
-
-    Indirect->Page = MmGetSystemAddressForMdlSafe(Indirect->Mdl,
-                                                  NormalPagePriority);
-
-    status = GranterGet(Granter,
-                        MmGetMdlPfnArray(Indirect->Mdl)[0],
-                        TRUE,
-                        &Indirect->Grant);
-    if (!NT_SUCCESS(status))
-        goto fail3;
-
-    return Indirect;
-
-fail3:
-    __FreePage(Indirect->Mdl);
-fail2:
-    __LookasideFree(&Target->IndirectList, Indirect);
-fail1:
-    return NULL;
-}
-
-static VOID
-TargetPutIndirect(
-    IN  PXENVBD_TARGET             Target,
-    IN  PXENVBD_INDIRECT        Indirect
-    )
-{
-    PXENVBD_GRANTER Granter = FrontendGetGranter(Target->Frontend);
-
-    if (Indirect->Grant)
-        GranterPut(Granter, Indirect->Grant);
-    if (Indirect->Page)
-        __FreePage(Indirect->Mdl);
-
-    RtlZeroMemory(Indirect, sizeof(XENVBD_INDIRECT));
-    __LookasideFree(&Target->IndirectList, Indirect);
-}
-
-static PXENVBD_SEGMENT
-TargetGetSegment(
-    IN  PXENVBD_TARGET             Target
-    )
-{
-    PXENVBD_SEGMENT             Segment;
-
-    Segment = __LookasideAlloc(&Target->SegmentList);
-    if (Segment == NULL)
-        goto fail1;
-
-    RtlZeroMemory(Segment, sizeof(XENVBD_SEGMENT));
-    return Segment;
-
-fail1:
-    return NULL;
-}
-
-static VOID
-TargetPutSegment(
-    IN  PXENVBD_TARGET             Target,
-    IN  PXENVBD_SEGMENT         Segment
-    )
-{
-    PXENVBD_GRANTER Granter = FrontendGetGranter(Target->Frontend);
-
-    if (Segment->Grant)
-        GranterPut(Granter, Segment->Grant);
-
-    if (Segment->BufferId)
-        BufferPut(Segment->BufferId);
-
-    if (Segment->Buffer)
-        MmUnmapLockedPages(Segment->Buffer, &Segment->Mdl);
-
-    RtlZeroMemory(Segment, sizeof(XENVBD_SEGMENT));
-    __LookasideFree(&Target->SegmentList, Segment);
-}
-
-static PXENVBD_REQUEST
-TargetGetRequest(
-    IN  PXENVBD_TARGET             Target
-    )
-{
-    PXENVBD_REQUEST             Request;
-
-    Request = __LookasideAlloc(&Target->RequestList);
-    if (Request == NULL)
-        goto fail1;
-
-    RtlZeroMemory(Request, sizeof(XENVBD_REQUEST));
-    Request->Id = (ULONG)InterlockedIncrement((PLONG)&Target->NextTag);
-    InitializeListHead(&Request->Segments);
-    InitializeListHead(&Request->Indirects);
-
-    return Request;
-
-fail1:
-    return NULL;
-}
-
-static VOID
-TargetPutRequest(
-    IN  PXENVBD_TARGET             Target,
-    IN  PXENVBD_REQUEST         Request
-    )
-{
-    PLIST_ENTRY     Entry;
-
-    for (;;) {
-        PXENVBD_SEGMENT Segment;
-
-        Entry = RemoveHeadList(&Request->Segments);
-        if (Entry == &Request->Segments)
-            break;
-        Segment = CONTAINING_RECORD(Entry, XENVBD_SEGMENT, Entry);
-        TargetPutSegment(Target, Segment);
-    }
-
-    for (;;) {
-        PXENVBD_INDIRECT    Indirect;
-
-        Entry = RemoveHeadList(&Request->Indirects);
-        if (Entry == &Request->Indirects)
-            break;
-        Indirect = CONTAINING_RECORD(Entry, XENVBD_INDIRECT, Entry);
-        TargetPutIndirect(Target, Indirect);
-    }
-
-    RtlZeroMemory(Request, sizeof(XENVBD_REQUEST));
-    __LookasideFree(&Target->RequestList, Request);
-}
-
-static FORCEINLINE PXENVBD_REQUEST
-TargetRequestFromTag(
-    IN  PXENVBD_TARGET             Target,
-    IN  ULONG                   Tag
-    )
-{
-    KIRQL           Irql;
-    PLIST_ENTRY     Entry;
-    PXENVBD_QUEUE   Queue = &Target->SubmittedReqs;
-
-    KeAcquireSpinLock(&Queue->Lock, &Irql);
-
-    for (Entry = Queue->List.Flink; Entry != &Queue->List; Entry = Entry->Flink) {
-        PXENVBD_REQUEST Request = CONTAINING_RECORD(Entry, XENVBD_REQUEST, Entry);
-        if (Request->Id == Tag) {
-            RemoveEntryList(&Request->Entry);
-            --Queue->Current;
-            KeReleaseSpinLock(&Queue->Lock, Irql);
-            return Request;
-        }
-    }
-
-    KeReleaseSpinLock(&Queue->Lock, Irql);
-    Warning("Target[%d] : Tag %x not found in submitted list (%u items)\n",
-            TargetGetTargetId(Target), Tag, QueueCount(Queue));
-    return NULL;
-}
-
-static FORCEINLINE VOID
-__TargetIncBlkifOpCount(
-    __in PXENVBD_TARGET             Target,
-    __in PXENVBD_REQUEST         Request
-    )
-{
-    switch (Request->Operation) {
-    case BLKIF_OP_READ:
-        if (Request->NrSegments > BLKIF_MAX_SEGMENTS_PER_REQUEST)
-            ++Target->BlkOpIndirectRead;
-        else
-            ++Target->BlkOpRead;
-        break;
-    case BLKIF_OP_WRITE:
-        if (Request->NrSegments > BLKIF_MAX_SEGMENTS_PER_REQUEST)
-            ++Target->BlkOpIndirectWrite;
-        else
-            ++Target->BlkOpWrite;
-        break;
-    case BLKIF_OP_WRITE_BARRIER:
-        ++Target->BlkOpBarrier;
-        break;
-    case BLKIF_OP_DISCARD:
-        ++Target->BlkOpDiscard;
-        break;
-    case BLKIF_OP_FLUSH_DISKCACHE:
-        ++Target->BlkOpFlush;
-        break;
-    default:
-        ASSERT(FALSE);
-        break;
-    }
-}
-
-static FORCEINLINE ULONG
-__SectorsPerPage(
-    __in ULONG                   SectorSize
-    )
-{
-    ASSERT3U(SectorSize, !=, 0);
-    return PAGE_SIZE / SectorSize;
-}
-
-static FORCEINLINE VOID
-__Operation(
-    __in UCHAR                   CdbOp,
-    __out PUCHAR                 RingOp,
-    __out PBOOLEAN               ReadOnly
-    )
-{
-    switch (CdbOp) {
-    case SCSIOP_READ:
-        *RingOp     = BLKIF_OP_READ;
-        *ReadOnly   = FALSE;
-        break;
-    case SCSIOP_WRITE:
-        *RingOp     = BLKIF_OP_WRITE;
-        *ReadOnly   = TRUE;
-        break;
-    default:
-        ASSERT(FALSE);
-    }
-}
-
-static FORCEINLINE ULONG
-__Offset(
-    __in STOR_PHYSICAL_ADDRESS   PhysAddr
-    )
-{
-    return (ULONG)(PhysAddr.QuadPart & (PAGE_SIZE - 1));
-}
-
-static FORCEINLINE PFN_NUMBER
-__Phys2Pfn(
-    __in STOR_PHYSICAL_ADDRESS   PhysAddr
-    )
-{
-    return (PFN_NUMBER)(PhysAddr.QuadPart >> PAGE_SHIFT);
-}
-
-static FORCEINLINE PFN_NUMBER
-__Virt2Pfn(
-    __in PVOID                   VirtAddr
-    )
-{
-    return (PFN_NUMBER)(MmGetPhysicalAddress(VirtAddr).QuadPart >> PAGE_SHIFT);
-}
-
-static FORCEINLINE MM_PAGE_PRIORITY
-__TargetPriority(
-    __in PXENVBD_TARGET             Target
-    )
-{
-    PXENVBD_CAPS   Caps = FrontendGetCaps(Target->Frontend);
-    if (!(Caps->Paging || 
-          Caps->Hibernation || 
-          Caps->DumpFile))
-        return NormalPagePriority;
-
-    return HighPagePriority;
+    RtlZeroMemory(SGList, sizeof(XENVBD_SG_LIST));
+    SGList->SGList = StorPortGetScatterGatherList(Adapter, Srb);
 }
 
 static FORCEINLINE VOID
@@ -808,13 +152,16 @@ SGListGet(
     )
 {
     PSTOR_SCATTER_GATHER_ELEMENT    SGElement;
+    ULONG                           Offset;
 
     ASSERT3U(SGList->Index, <, SGList->SGList->NumberOfElements);
 
     SGElement = &SGList->SGList->List[SGList->Index];
 
     SGList->PhysAddr.QuadPart = SGElement->PhysicalAddress.QuadPart + SGList->Offset;
-    SGList->PhysLen           = __min(PAGE_SIZE - __Offset(SGList->PhysAddr) - SGList->Length, SGElement->Length - SGList->Offset);
+    Offset = (ULONG)(SGList->PhysAddr.QuadPart & (PAGE_SIZE - 1));
+    SGList->PhysLen           = __min(PAGE_SIZE - Offset - SGList->Length,
+                                      SGElement->Length - SGList->Offset);
 
     ASSERT3U(SGList->PhysLen, <=, PAGE_SIZE);
     ASSERT3U(SGList->Offset, <, SGElement->Length);
@@ -838,52 +185,342 @@ SGListNext(
     return !((SGList->PhysAddr.QuadPart & AlignmentMask) || (SGList->PhysLen & AlignmentMask));
 }
 
-static FORCEINLINE BOOLEAN
-MapSegmentBuffer(
-    IN  PXENVBD_TARGET             Target,
-    IN  PXENVBD_SEGMENT         Segment,
-    IN  PXENVBD_SG_LIST         SGList,
-    IN  ULONG                   SectorSize,
-    IN  ULONG                   SectorsNow
+static FORCEINLINE PFN_NUMBER
+SGListPfn(
+    IN  PXENVBD_SG_LIST SGList
     )
 {
-    PMDL    Mdl;
+    return (PFN_NUMBER)(SGList->PhysAddr.QuadPart >> PAGE_SHIFT);
+}
 
+static FORCEINLINE ULONG
+SGListOffset(
+    IN  PXENVBD_SG_LIST SGList
+    )
+{
+    return (ULONG)(SGList->PhysAddr.QuadPart & (PAGE_SIZE - 1));
+}
+
+static FORCEINLINE ULONG
+SGListLength(
+    IN  PXENVBD_SG_LIST SGList
+    )
+{
+    return SGList->PhysLen;
+}
+
+static FORCEINLINE PVOID
+__TargetAllocate(
+    IN  ULONG   Size
+    )
+{
+    PVOID       Buffer;
+    Buffer = ExAllocatePoolWithTag(NonPagedPool,
+                                   Size,
+                                   TARGET_POOL_TAG);
+    if (Buffer)
+        RtlZeroMemory(Buffer, Size);
+    return Buffer;
+}
+
+static FORCEINLINE VOID
+__TargetFree(
+    IN  PVOID   Buffer
+    )
+{
+    if (Buffer)
+        ExFreePoolWithTag(Buffer, TARGET_POOL_TAG);
+}
+
+#define TARGET_GET_PROPERTY(_name, _type)       \
+_type                                           \
+TargetGet ## _name ## (                         \
+    IN  PXENVBD_TARGET  Target                  \
+    )                                           \
+{                                               \
+    return Target-> ## _name ## ;               \
+}
+
+TARGET_GET_PROPERTY(DeviceId, ULONG)
+TARGET_GET_PROPERTY(TargetId, ULONG)
+TARGET_GET_PROPERTY(DeviceObject, PDEVICE_OBJECT)
+TARGET_GET_PROPERTY(Missing, BOOLEAN)
+TARGET_GET_PROPERTY(DevicePnpState, DEVICE_PNP_STATE)
+TARGET_GET_PROPERTY(Adapter, PXENVBD_ADAPTER)
+TARGET_GET_PROPERTY(Granter, PXENVBD_GRANTER)
+TARGET_GET_PROPERTY(Path, PCHAR)
+TARGET_GET_PROPERTY(BackendPath, PCHAR)
+TARGET_GET_PROPERTY(BackendId, USHORT)
+TARGET_GET_PROPERTY(Removable, BOOLEAN)
+
+#undef TARGET_GET_PROPERTY
+
+static FORCEINLINE PCHAR
+DevicePnpStateName(
+    IN  DEVICE_PNP_STATE    State
+    )
+{
+    switch (State) {
+    case Invalid:               return "Invalid";
+    case Present:               return "Present";
+    case Enumerated:            return "Enumerated";
+    case Added:                 return "Added";
+    case Started:               return "Started";
+    case StopPending:           return "StopPending";
+    case Stopped:               return "Stopped";
+    case RemovePending:         return "RemovePending";
+    case SurpriseRemovePending: return "SurpriseRemovePending";
+    case Deleted:               return "Deleted";
+    default:                    return "<UNKNOWN>";
+    }
+}
+
+static FORCEINLINE VOID
+TargetRestoreDevicePnpState(
+    IN  PXENVBD_TARGET      Target
+    )
+{
+    Verbose("[%u] %s --> %s\n",
+            Target->TargetId,
+            DevicePnpStateName(Target->DevicePnpState),
+            DevicePnpStateName(Target->PrevPnpState));
+    Target->DevicePnpState = Target->PrevPnpState;
+}
+
+VOID
+TargetSetDevicePnpState(
+    IN  PXENVBD_TARGET      Target,
+    IN  DEVICE_PNP_STATE    State
+    )
+{
+    Verbose("[%u] %s --> %s\n",
+            Target->TargetId,
+            DevicePnpStateName(Target->DevicePnpState),
+            DevicePnpStateName(State));
+    Target->PrevPnpState = Target->DevicePnpState;
+    Target->DevicePnpState = State;
+}
+VOID
+TargetSetDeviceObject(
+    IN  PXENVBD_TARGET  Target,
+    IN  PDEVICE_OBJECT  DeviceObject
+    )
+{
+    Verbose("[%u] DevObj = 0x%p\n",
+            Target->TargetId,
+            DeviceObject);
+    Target->DeviceObject = DeviceObject;
+}
+
+VOID
+TargetSetMissing(
+    IN  PXENVBD_TARGET  Target,
+    IN  const CHAR*     Reason
+    )
+{
+    Verbose("[%u] Missing: %s\n", Target->TargetId, Reason);
+    Target->Missing = TRUE;
+}
+
+static PXENVBD_INDIRECT
+TargetGetIndirect(
+    IN  PXENVBD_TARGET  Target
+    )
+{
+    PXENVBD_INDIRECT    Indirect;
+    NTSTATUS            status;
+
+    Indirect = ExAllocateFromNPagedLookasideList(&Target->IndirectList);
+    if (Indirect == NULL)
+        goto fail1;
+
+    RtlZeroMemory(Indirect, sizeof(XENVBD_INDIRECT));
+
+    InitializeListHead(&Indirect->ListEntry);
+    Indirect->Mdl = __AllocatePage();
+    if (Indirect->Mdl == NULL)
+        goto fail2;
+
+    Indirect->Page = MmGetSystemAddressForMdlSafe(Indirect->Mdl,
+                                                  NormalPagePriority);
+    ASSERT(Indirect->Page != NULL);
+
+    status = GranterGet(Target->Granter,
+                        MmGetMdlPfnArray(Indirect->Mdl)[0],
+                        TRUE,
+                        &Indirect->Grant);
+    if (!NT_SUCCESS(status))
+        goto fail3;
+
+    return Indirect;
+
+fail3:
+    __FreePage(Indirect->Mdl);
+fail2:
+    RtlZeroMemory(Indirect, sizeof(XENVBD_INDIRECT));
+    ExFreeToNPagedLookasideList(&Target->IndirectList, Indirect);
+fail1:
+    return NULL;
+}
+
+static VOID
+TargetPutIndirect(
+    IN  PXENVBD_TARGET      Target,
+    IN  PXENVBD_INDIRECT    Indirect
+    )
+{
+    if (Indirect->Grant)
+        GranterPut(Target->Granter, Indirect->Grant);
+
+    if (Indirect->Page)
+        __FreePage(Indirect->Mdl);
+
+    RtlZeroMemory(Indirect, sizeof(XENVBD_INDIRECT));
+    ExFreeToNPagedLookasideList(&Target->IndirectList, Indirect);
+}
+
+static PXENVBD_SEGMENT
+TargetGetSegment(
+    IN  PXENVBD_TARGET  Target
+    )
+{
+    PXENVBD_SEGMENT     Segment;
+
+    Segment = ExAllocateFromNPagedLookasideList(&Target->SegmentList);
+    if (Segment == NULL)
+        goto fail1;
+
+    RtlZeroMemory(Segment, sizeof(XENVBD_SEGMENT));
+
+    InitializeListHead(&Segment->ListEntry);
+
+    return Segment;
+
+fail1:
+    return NULL;
+}
+
+static VOID
+TargetPutSegment(
+    IN  PXENVBD_TARGET  Target,
+    IN  PXENVBD_SEGMENT Segment
+    )
+{
+    if (Segment->Grant)
+        GranterPut(Target->Granter, Segment->Grant);
+ 
+    if (Segment->Buffer)
+        MmUnmapLockedPages(Segment->Buffer, &Segment->Mdl);
+
+    if (Segment->BufferId)
+        BufferPut(Segment->BufferId);
+
+    RtlZeroMemory(Segment, sizeof(XENVBD_SEGMENT));
+    ExFreeToNPagedLookasideList(&Target->SegmentList, Segment);
+}
+
+static PXENVBD_REQUEST
+TargetGetRequest(
+    IN  PXENVBD_TARGET  Target
+    )
+{
+    PXENVBD_REQUEST     Request;
+
+    Request = ExAllocateFromNPagedLookasideList(&Target->RequestList);
+    if (Request == NULL)
+        goto fail1;
+
+    RtlZeroMemory(Request, sizeof(XENVBD_REQUEST));
+    Request->Id = (ULONG64)(ULONG_PTR)Request;
+
+    InitializeListHead(&Request->ListEntry);
+    InitializeListHead(&Request->Segments);
+    InitializeListHead(&Request->Indirects);
+
+    return Request;
+
+fail1:
+    return NULL;
+}
+
+static VOID
+TargetPutRequest(
+    IN  PXENVBD_TARGET      Target,
+    IN  PXENVBD_REQUEST     Request
+    )
+{
+    for (;;) {
+        PLIST_ENTRY         ListEntry;
+        PXENVBD_INDIRECT    Indirect;
+
+        ListEntry = RemoveHeadList(&Request->Indirects);
+        if (ListEntry == &Request->Indirects)
+            break;
+
+        Indirect = CONTAINING_RECORD(ListEntry, XENVBD_INDIRECT, ListEntry);
+        TargetPutIndirect(Target, Indirect);
+    }
+    for (;;) {
+        PLIST_ENTRY         ListEntry;
+        PXENVBD_SEGMENT     Segment;
+
+        ListEntry = RemoveHeadList(&Request->Segments);
+        if (ListEntry == &Request->Segments)
+            break;
+
+        Segment = CONTAINING_RECORD(ListEntry, XENVBD_SEGMENT, ListEntry);
+        TargetPutSegment(Target, Segment);
+    }
+
+    RtlZeroMemory(Request, sizeof(XENVBD_REQUEST));
+    ExFreeToNPagedLookasideList(&Target->RequestList, Request);
+}
+
+static FORCEINLINE BOOLEAN
+BufferMap(
+    IN  PXENVBD_SEGMENT Segment,
+    IN  PXENVBD_SG_LIST SGList,
+    IN  ULONG           Length
+    )
+{
     // map PhysAddr to 1 or 2 pages and lock for VirtAddr
 #pragma warning(push)
 #pragma warning(disable:28145)
-    Mdl = &Segment->Mdl;
-    Mdl->Next           = NULL;
-    Mdl->Size           = (SHORT)(sizeof(MDL) + sizeof(PFN_NUMBER));
-    Mdl->MdlFlags       = MDL_PAGES_LOCKED;
-    Mdl->Process        = NULL;
-    Mdl->MappedSystemVa = NULL;
-    Mdl->StartVa        = NULL;
-    Mdl->ByteCount      = SGList->PhysLen;
-    Mdl->ByteOffset     = __Offset(SGList->PhysAddr);
-    Segment->Pfn[0]     = __Phys2Pfn(SGList->PhysAddr);
+    Segment->Mdl.Next           = NULL;
+    Segment->Mdl.Size           = (SHORT)(sizeof(MDL) + sizeof(PFN_NUMBER));
+    Segment->Mdl.MdlFlags       = MDL_PAGES_LOCKED;
+    Segment->Mdl.Process        = NULL;
+    Segment->Mdl.MappedSystemVa = NULL;
+    Segment->Mdl.StartVa        = NULL;
+    Segment->Mdl.ByteCount      = SGListLength(SGList);
+    Segment->Mdl.ByteOffset     = SGListOffset(SGList);
+    Segment->Pfn[0]             = SGListPfn(SGList);
 
-    if (SGList->PhysLen < SectorsNow * SectorSize) {
+    if (Segment->Mdl.ByteCount < Length) {
+        // need part of next page
         SGListGet(SGList);
-        Mdl->Size       += sizeof(PFN_NUMBER);
-        Mdl->ByteCount  = Mdl->ByteCount + SGList->PhysLen;
-        Segment->Pfn[1] = __Phys2Pfn(SGList->PhysAddr);
+        Segment->Mdl.Size       += sizeof(PFN_NUMBER);
+        Segment->Mdl.ByteCount  = Segment->Mdl.ByteCount + SGListLength(SGList);
+        Segment->Pfn[1]         = SGListPfn(SGList);
     }
 #pragma warning(pop)
 
-    ASSERT((Mdl->ByteCount & (SectorSize - 1)) == 0);
-    ASSERT3U(Mdl->ByteCount, <=, PAGE_SIZE);
-    ASSERT3U(SectorsNow, ==, (Mdl->ByteCount / SectorSize));
+    ASSERT3U(Segment->Mdl.ByteCount, <=, PAGE_SIZE);
+    ASSERT3U(Segment->Mdl.ByteCount, ==, Length);
                 
-    Segment->Length = __min(Mdl->ByteCount, PAGE_SIZE);
-    Segment->Buffer = MmMapLockedPagesSpecifyCache(Mdl, KernelMode,
-                            MmCached, NULL, FALSE, __TargetPriority(Target));
-    if (!Segment->Buffer) {
+    Segment->Length = min(Segment->Mdl.ByteCount, PAGE_SIZE);
+    Segment->Buffer = MmMapLockedPagesSpecifyCache(&Segment->Mdl,
+                                                   KernelMode,
+                                                   MmCached,
+                                                   NULL,
+                                                   FALSE,
+                                                   NormalPagePriority);
+    if (Segment->Buffer == NULL)
         goto fail;
-    }
 
-    ASSERT3P(MmGetMdlPfnArray(Mdl)[0], ==, Segment->Pfn[0]);
-    ASSERT3P(MmGetMdlPfnArray(Mdl)[1], ==, Segment->Pfn[1]);
+    ASSERT3P(MmGetMdlPfnArray(&Segment->Mdl)[0], ==, Segment->Pfn[0]);
+    // if only 1 Pfn is used, this triggers an array-out-of-bounds condition!
+    //ASSERT3P(MmGetMdlPfnArray(&Segment->Mdl)[1], ==, Segment->Pfn[1]);
  
     return TRUE;
 
@@ -891,372 +528,176 @@ fail:
     return FALSE;
 }
 
-static FORCEINLINE VOID
-RequestCopyOutput(
-    __in PXENVBD_REQUEST         Request
-    )
-{
-    PLIST_ENTRY     Entry;
-
-    if (Request->Operation != BLKIF_OP_READ)
-        return;
-
-    for (Entry = Request->Segments.Flink;
-            Entry != &Request->Segments;
-            Entry = Entry->Flink) {
-        PXENVBD_SEGMENT Segment = CONTAINING_RECORD(Entry, XENVBD_SEGMENT, Entry);
-
-        if (Segment->BufferId)
-            BufferCopyOut(Segment->BufferId, Segment->Buffer, Segment->Length);
-    }
-}
-
 static BOOLEAN
-PrepareSegment(
-    IN  PXENVBD_TARGET             Target,
-    IN  PXENVBD_SEGMENT         Segment,
-    IN  PXENVBD_SG_LIST         SGList,
-    IN  BOOLEAN                 ReadOnly,
-    IN  ULONG                   SectorsLeft,
-    OUT PULONG                  SectorsNow
+TargetPrepareRW(
+    IN  PXENVBD_TARGET  Target,
+    IN  PXENVBD_SRBEXT  SrbExt,
+    IN  UCHAR           Operation
     )
 {
-    PFN_NUMBER      Pfn;
-    NTSTATUS        Status;
-    PXENVBD_GRANTER Granter = FrontendGetGranter(Target->Frontend);
-    const ULONG     SectorSize = TargetSectorSize(Target);
-    const ULONG     SectorsPerPage = __SectorsPerPage(SectorSize);
-
-    if (SGListNext(SGList, SectorSize - 1)) {
-        ++Target->SegsGranted;
-        // get first sector, last sector and count
-        Segment->FirstSector    = (UCHAR)((__Offset(SGList->PhysAddr) + SectorSize - 1) / SectorSize);
-        *SectorsNow             = __min(SectorsLeft, SectorsPerPage - Segment->FirstSector);
-        Segment->LastSector     = (UCHAR)(Segment->FirstSector + *SectorsNow - 1);
-        Segment->BufferId       = NULL; // granted, ensure its null
-        Segment->Buffer         = NULL; // granted, ensure its null
-        Segment->Length         = 0;    // granted, ensure its 0
-        Pfn                     = __Phys2Pfn(SGList->PhysAddr);
-
-        ASSERT3U((SGList->PhysLen / SectorSize), ==, *SectorsNow);
-        ASSERT3U((SGList->PhysLen & (SectorSize - 1)), ==, 0);
-    } else {
-        ++Target->SegsBounced;
-        // get first sector, last sector and count
-        Segment->FirstSector    = 0;
-        *SectorsNow             = __min(SectorsLeft, SectorsPerPage);
-        Segment->LastSector     = (UCHAR)(*SectorsNow - 1);
-
-        // map SGList to Virtual Address. Populates Segment->Buffer and Segment->Length
-        if (!MapSegmentBuffer(Target, Segment, SGList, SectorSize, *SectorsNow)) {
-            ++Target->FailedMaps;
-            goto fail1;
-        }
-
-        // get a buffer
-        if (!BufferGet(Segment, &Segment->BufferId, &Pfn)) {
-            ++Target->FailedBounces;
-            goto fail2;
-        }
-
-        // copy contents in
-        if (ReadOnly) { // Operation == BLKIF_OP_WRITE
-            BufferCopyIn(Segment->BufferId, Segment->Buffer, Segment->Length);
-        }
-    }
-
-    // Grant segment's page
-    Status = GranterGet(Granter, Pfn, ReadOnly, &Segment->Grant);
-    if (!NT_SUCCESS(Status)) {
-        ++Target->FailedGrants;
-        goto fail3;
-    }
-
-    return TRUE;
-
-fail3:
-fail2:
-fail1:
-    return FALSE;
-}
-
-static BOOLEAN
-PrepareBlkifReadWrite(
-    IN  PXENVBD_TARGET             Target,
-    IN  PXENVBD_REQUEST         Request,
-    IN  PXENVBD_SG_LIST         SGList,
-    IN  ULONG                   MaxSegments,
-    IN  ULONG64                 SectorStart,
-    IN  ULONG                   SectorsLeft,
-    OUT PULONG                  SectorsDone
-    )
-{
-    UCHAR           Operation;
-    BOOLEAN         ReadOnly;
-    ULONG           Index;
-    __Operation(Cdb_OperationEx(Request->Srb), &Operation, &ReadOnly);
-
-    Request->Operation  = Operation;
-    Request->NrSegments = 0;
-    Request->FirstSector = SectorStart;
-
-    for (Index = 0;
-                Index < MaxSegments &&
-                SectorsLeft > 0;
-                        ++Index) {
-        PXENVBD_SEGMENT Segment;
-        ULONG           SectorsNow;
-
-        Segment = TargetGetSegment(Target);
-        if (Segment == NULL)
-            goto fail1;
-
-        InsertTailList(&Request->Segments, &Segment->Entry);
-        ++Request->NrSegments;
-
-        if (!PrepareSegment(Target,
-                            Segment,
-                            SGList,
-                            ReadOnly,
-                            SectorsLeft,
-                            &SectorsNow))
-            goto fail2;
-
-        *SectorsDone += SectorsNow;
-        SectorsLeft  -= SectorsNow;
-    }
-    ASSERT3U(Request->NrSegments, >, 0);
-    ASSERT3U(Request->NrSegments, <=, MaxSegments);
-
-    return TRUE;
-
-fail2:
-fail1:
-    return FALSE;
-}
-
-static BOOLEAN
-PrepareBlkifIndirect(
-    IN  PXENVBD_TARGET             Target,
-    IN  PXENVBD_REQUEST         Request
-    )
-{
-    ULONG           Index;
-    ULONG           NrSegments = 0;
-
-    for (Index = 0;
-            Index < BLKIF_MAX_INDIRECT_PAGES_PER_REQUEST &&
-            NrSegments < Request->NrSegments;
-                ++Index) {
-        PXENVBD_INDIRECT    Indirect;
-
-        Indirect = TargetGetIndirect(Target);
-        if (Indirect == NULL)
-            goto fail1;
-        InsertTailList(&Request->Indirects, &Indirect->Entry);
-
-        NrSegments += XENVBD_MAX_SEGMENTS_PER_PAGE;
-    }
-
-    return TRUE;
-
-fail1:
-    return FALSE;
-}
-
-static FORCEINLINE ULONG
-UseIndirect(
-    IN  PXENVBD_TARGET             Target,
-    IN  ULONG                   SectorsLeft
-    )
-{
-    const ULONG SectorsPerPage = __SectorsPerPage(TargetSectorSize(Target));
-    const ULONG MaxIndirectSegs = FrontendGetFeatures(Target->Frontend)->Indirect;
-
-    if (MaxIndirectSegs <= BLKIF_MAX_SEGMENTS_PER_REQUEST)
-        return BLKIF_MAX_SEGMENTS_PER_REQUEST; // not supported
-
-    if (SectorsLeft < BLKIF_MAX_SEGMENTS_PER_REQUEST * SectorsPerPage)
-        return BLKIF_MAX_SEGMENTS_PER_REQUEST; // first into a single BLKIF_OP_{READ/WRITE}
-
-    return MaxIndirectSegs;
-}
-
-static FORCEINLINE ULONG
-TargetQueueRequestList(
-    IN  PXENVBD_TARGET     Target,
-    IN  PLIST_ENTRY     List
-    )
-{
-    ULONG               Count = 0;
-    for (;;) {
-        PXENVBD_REQUEST Request;
-        PLIST_ENTRY     Entry;
-
-        Entry = RemoveHeadList(List);
-        if (Entry == List)
-            break;
-
-        ++Count;
-        Request = CONTAINING_RECORD(Entry, XENVBD_REQUEST, Entry);
-        __TargetIncBlkifOpCount(Target, Request);
-        QueueAppend(&Target->PreparedReqs, &Request->Entry);
-    }
-    return Count;
-}
-
-static FORCEINLINE VOID
-TargetCancelRequestList(
-    IN  PXENVBD_TARGET     Target,
-    IN  PLIST_ENTRY     List
-    )
-{
-    for (;;) {
-        PXENVBD_REQUEST Request;
-        PLIST_ENTRY     Entry;
-
-        Entry = RemoveHeadList(List);
-        if (Entry == List)
-            break;
-
-        Request = CONTAINING_RECORD(Entry, XENVBD_REQUEST, Entry);
-        TargetPutRequest(Target, Request);
-    }
-}
-
-__checkReturn
-static BOOLEAN
-PrepareReadWrite(
-    __in PXENVBD_TARGET             Target,
-    __in PSCSI_REQUEST_BLOCK     Srb
-    )
-{
-    PXENVBD_SRBEXT  SrbExt = Srb->SrbExtension;
-    ULONG64         SectorStart = Cdb_LogicalBlock(Srb);
-    ULONG           SectorsLeft = Cdb_TransferBlock(Srb);
-    LIST_ENTRY      List;
-    XENVBD_SG_LIST  SGList;
-    ULONG           DebugCount;
-
-    Srb->SrbStatus = SRB_STATUS_PENDING;
+    PSCSI_REQUEST_BLOCK Srb = SrbExt->Srb;
+    ULONG64             SectorStart = Cdb_LogicalBlock(Srb);
+    ULONG               SectorsLeft = Cdb_TransferBlock(Srb);
+    LIST_ENTRY          List;
+    XENVBD_SG_LIST      SGList;
+    KIRQL               Irql;
+    const ULONG         SectorSize = Target->SectorSize;
+    const ULONG         SectorMask = SectorSize - 1;
+    const ULONG         SectorsPerPage = PAGE_SIZE / SectorSize;
 
     InitializeListHead(&List);
-    SrbExt->RequestCount = 0;
+    SGListInit(&SGList, TargetGetAdapter(Target), Srb);
 
-    RtlZeroMemory(&SGList, sizeof(SGList));
-    SGList.SGList = StorPortGetScatterGatherList(TargetGetAdapter(Target), Srb);
+    // validate SectorStart, SectorsLeft fits in this target (prevent read/write beyond extents)
 
     while (SectorsLeft > 0) {
-        ULONG           MaxSegments;
-        ULONG           SectorsDone = 0;
         PXENVBD_REQUEST Request;
+        ULONG           Index;
+        ULONG           MaxSegments;
+
+        MaxSegments = Target->FeatureIndirect;
+        MaxSegments = min(MaxSegments, XENVBD_MAX_SEGMENTS_PER_INDIRECT); // limit to sensible value
+        MaxSegments = max(MaxSegments, BLKIF_MAX_SEGMENTS_PER_REQUEST);   // ensure at least 11
+        ASSERT3U(MaxSegments, >=, BLKIF_MAX_SEGMENTS_PER_REQUEST);
+        ASSERT3U(MaxSegments, <=, XENVBD_MAX_SEGMENTS_PER_INDIRECT);
 
         Request = TargetGetRequest(Target);
         if (Request == NULL) 
             goto fail1;
-        InsertTailList(&List, &Request->Entry);
+        InsertTailList(&List, &Request->ListEntry);
         InterlockedIncrement(&SrbExt->RequestCount);
         
-        Request->Srb    = Srb;
-        MaxSegments = UseIndirect(Target, SectorsLeft);
+        Request->SrbExt     = SrbExt;
+        Request->Operation  = Operation;
+        Request->FirstSector = SectorStart;
 
-        if (!PrepareBlkifReadWrite(Target,
-                                   Request,
-                                   &SGList,
-                                   MaxSegments,
-                                   SectorStart,
-                                   SectorsLeft,
-                                   &SectorsDone))
-            goto fail2;
+        // build segments
+        for (Index = 0; Index < MaxSegments; ++Index) {
+            PXENVBD_SEGMENT Segment;
+            ULONG           SectorsNow;
+            PFN_NUMBER      Pfn;
+            NTSTATUS        status;
 
-        if (MaxSegments > BLKIF_MAX_SEGMENTS_PER_REQUEST) {
-            if (!PrepareBlkifIndirect(Target, Request))
-                goto fail3;
+            if (SectorsLeft == 0)
+                break;
+
+            Segment = TargetGetSegment(Target);
+            if (Segment == NULL)
+                goto fail2;
+            InsertTailList(&Request->Segments, &Segment->ListEntry);
+            ++Request->NrSegments;
+
+            if (SGListNext(&SGList, SectorMask)) {
+                ASSERT((SGListOffset(&SGList) & SectorMask) == 0);
+
+                Segment->FirstSector = (UCHAR)(SGListOffset(&SGList) / SectorSize);
+                SectorsNow           = min(SectorsLeft, SectorsPerPage - Segment->FirstSector);
+                Segment->LastSector  = (UCHAR)(Segment->FirstSector + SectorsNow - 1);
+
+                Pfn = SGListPfn(&SGList);
+            } else {
+                ASSERT((SGListOffset(&SGList) & SectorMask) != 0);
+
+                Segment->FirstSector = (UCHAR)0;
+                SectorsNow           = min(SectorsLeft, SectorsPerPage);
+                Segment->LastSector  = (UCHAR)(SectorsNow - 1);
+
+                if (!BufferMap(Segment, &SGList, SectorsNow * SectorSize))
+                    goto fail3;
+
+                if (!BufferGet(Segment, &Segment->BufferId, &Pfn))
+                    goto fail4;
+
+                if (Operation == BLKIF_OP_WRITE) {
+                    BufferCopyIn(Segment->BufferId,
+                                 Segment->Buffer,
+                                 Segment->Length);
+                }
+            }
+
+            status = GranterGet(Target->Granter,
+                                Pfn,
+                                Operation == BLKIF_OP_WRITE,
+                                &Segment->Grant);
+            if (!NT_SUCCESS(status))
+                goto fail5;
+
+            SectorStart += SectorsNow;
+            SectorsLeft -= SectorsNow;
         }
 
-        SectorsLeft -= SectorsDone;
-        SectorStart += SectorsDone;
+        // build indirects
+        if (MaxSegments > BLKIF_MAX_SEGMENTS_PER_REQUEST) {
+            // round up
+            ULONG   NumInd = (Request->NrSegments + XENVBD_MAX_SEGMENTS_PER_PAGE - 1) /
+                              XENVBD_MAX_SEGMENTS_PER_PAGE;
+
+            ASSERT(NumInd <= BLKIF_MAX_INDIRECT_PAGES_PER_REQUEST);
+            while (NumInd--) {
+                PXENVBD_INDIRECT    Indirect;
+
+                Indirect = TargetGetIndirect(Target);
+                if (Indirect == NULL)
+                    goto fail6;
+
+                InsertTailList(&Request->Indirects, &Indirect->ListEntry);
+            }
+        }
     }
 
-    DebugCount = TargetQueueRequestList(Target, &List);
-    if (DebugCount != (ULONG)SrbExt->RequestCount) {
-        Trace("[%u] %d != %u\n", TargetGetTargetId(Target), SrbExt->RequestCount, DebugCount);
+    Srb->SrbStatus = SRB_STATUS_PENDING;
+
+    KeAcquireSpinLock(&Target->QueueLock, &Irql);
+    for (;;) {
+        PLIST_ENTRY     ListEntry;
+        PXENVBD_REQUEST Request;
+
+        ListEntry = RemoveHeadList(&List);
+        if (ListEntry == &List)
+            break;
+        Request = CONTAINING_RECORD(ListEntry, XENVBD_REQUEST, ListEntry);
+        InsertTailList(&Target->Prepared, &Request->ListEntry);
     }
+    KeReleaseSpinLock(&Target->QueueLock, Irql);
+
     return TRUE;
 
+fail6:
+fail5:
+fail4:
 fail3:
 fail2:
 fail1:
-    TargetCancelRequestList(Target, &List);
-    SrbExt->RequestCount = 0;
     Srb->SrbStatus = SRB_STATUS_ERROR;
-    return FALSE;
-}
+    for (;;) {
+        PLIST_ENTRY     ListEntry;
+        PXENVBD_REQUEST Request;
 
-__checkReturn
-static BOOLEAN
-PrepareSyncCache(
-    __in PXENVBD_TARGET             Target,
-    __in PSCSI_REQUEST_BLOCK     Srb
-    )
-{
-    PXENVBD_SRBEXT      SrbExt = Srb->SrbExtension;
-    PXENVBD_REQUEST     Request;
-    LIST_ENTRY          List;
-    UCHAR               Operation;
-    ULONG               DebugCount;
-
-    Srb->SrbStatus = SRB_STATUS_PENDING;
-    
-    if (FrontendGetDiskInfo(Target->Frontend)->FlushCache)
-        Operation = BLKIF_OP_FLUSH_DISKCACHE;
-    else
-        Operation = BLKIF_OP_WRITE_BARRIER;
-
-    InitializeListHead(&List);
-    SrbExt->RequestCount = 0;
-
-    Request = TargetGetRequest(Target);
-    if (Request == NULL)
-        goto fail1;
-    InsertTailList(&List, &Request->Entry);
-    InterlockedIncrement(&SrbExt->RequestCount);
-
-    Request->Srb        = Srb;
-    Request->Operation  = Operation;
-    Request->FirstSector = Cdb_LogicalBlock(Srb);
-
-    DebugCount = TargetQueueRequestList(Target, &List);
-    if (DebugCount != (ULONG)SrbExt->RequestCount) {
-        Trace("[%u] %d != %u\n", TargetGetTargetId(Target), SrbExt->RequestCount, DebugCount);
+        ListEntry = RemoveHeadList(&List);
+        if (ListEntry == &List)
+            break;
+        Request = CONTAINING_RECORD(ListEntry, XENVBD_REQUEST, ListEntry);
+        TargetPutRequest(Target, Request);
     }
-    return TRUE;
-
-fail1:
-    TargetCancelRequestList(Target, &List);
-    SrbExt->RequestCount = 0;
-    Srb->SrbStatus = SRB_STATUS_ERROR;
     return FALSE;
 }
 
-__checkReturn
 static BOOLEAN
-PrepareUnmap(
-    __in PXENVBD_TARGET             Target,
-    __in PSCSI_REQUEST_BLOCK     Srb
+TargetPrepareUnmap(
+    IN  PXENVBD_TARGET  Target,
+    IN  PXENVBD_SRBEXT  SrbExt
     )
 {
-    PXENVBD_SRBEXT      SrbExt = Srb->SrbExtension;
+    PSCSI_REQUEST_BLOCK Srb = SrbExt->Srb;
     PUNMAP_LIST_HEADER  Unmap = Srb->DataBuffer;
-	ULONG               Count = _byteswap_ushort(*(PUSHORT)Unmap->BlockDescrDataLength) / sizeof(UNMAP_BLOCK_DESCRIPTOR);
+	ULONG               Count;
     ULONG               Index;
     LIST_ENTRY          List;
-    ULONG               DebugCount;
-
-    Srb->SrbStatus = SRB_STATUS_PENDING;
+    KIRQL               Irql;
 
     InitializeListHead(&List);
-    SrbExt->RequestCount = 0;
+    Count = _byteswap_ushort(*(PUSHORT)Unmap->BlockDescrDataLength) / 
+            sizeof(UNMAP_BLOCK_DESCRIPTOR);
 
     for (Index = 0; Index < Count; ++Index) {
         PUNMAP_BLOCK_DESCRIPTOR Descr = &Unmap->Descriptors[Index];
@@ -1265,185 +706,177 @@ PrepareUnmap(
         Request = TargetGetRequest(Target);
         if (Request == NULL)
             goto fail1;
-        InsertTailList(&List, &Request->Entry);
+        InsertTailList(&List, &Request->ListEntry);
         InterlockedIncrement(&SrbExt->RequestCount);
 
-        Request->Srb            = Srb;
+        Request->SrbExt         = SrbExt;
         Request->Operation      = BLKIF_OP_DISCARD;
         Request->FirstSector    = _byteswap_uint64(*(PULONG64)Descr->StartingLba);
         Request->NrSectors      = _byteswap_ulong(*(PULONG)Descr->LbaCount);
         Request->Flags          = 0;
     }
 
-    DebugCount = TargetQueueRequestList(Target, &List);
-    if (DebugCount != (ULONG)SrbExt->RequestCount) {
-        Trace("[%u] %d != %u\n", TargetGetTargetId(Target), SrbExt->RequestCount, DebugCount);
+    Srb->SrbStatus = SRB_STATUS_PENDING;
+
+    KeAcquireSpinLock(&Target->QueueLock, &Irql);
+    for (;;) {
+        PLIST_ENTRY     ListEntry;
+        PXENVBD_REQUEST Request;
+
+        ListEntry = RemoveHeadList(&List);
+        if (ListEntry == &List)
+            break;
+        Request = CONTAINING_RECORD(ListEntry, XENVBD_REQUEST, ListEntry);
+        InsertTailList(&Target->Prepared, &Request->ListEntry);
     }
+    KeReleaseSpinLock(&Target->QueueLock, Irql);
+
     return TRUE;
 
-fail1:
-    TargetCancelRequestList(Target, &List);
-    SrbExt->RequestCount = 0;
+fail1: 
     Srb->SrbStatus = SRB_STATUS_ERROR;
+    for (;;) {
+        PLIST_ENTRY     ListEntry;
+        PXENVBD_REQUEST Request;
+
+        ListEntry = RemoveHeadList(&List);
+        if (ListEntry == &List)
+            break;
+        Request = CONTAINING_RECORD(ListEntry, XENVBD_REQUEST, ListEntry);
+        TargetPutRequest(Target, Request);
+    }
     return FALSE;
 }
 
-//=============================================================================
-// Queue-Related
-static FORCEINLINE VOID
-__TargetPauseDataPath(
-    __in PXENVBD_TARGET             Target,
-    __in BOOLEAN                 Timeout
+static BOOLEAN
+TargetPrepareSync(
+    IN  PXENVBD_TARGET  Target,
+    IN  PXENVBD_SRBEXT  SrbExt,
+    IN  UCHAR           Operation
     )
 {
+    PSCSI_REQUEST_BLOCK Srb = SrbExt->Srb;
+    PXENVBD_REQUEST     Request;
     KIRQL               Irql;
-    ULONG               Requests;
-    ULONG               Count = 0;
-    PXENVBD_NOTIFIER    Notifier = FrontendGetNotifier(Target->Frontend);
-    PXENVBD_BLOCKRING   BlockRing = FrontendGetBlockRing(Target->Frontend);
 
-    KeAcquireSpinLock(&Target->Lock, &Irql);
-    ++Target->Paused;
-    KeReleaseSpinLock(&Target->Lock, Irql);
+    Srb->SrbStatus = SRB_STATUS_ERROR;
+    Request = TargetGetRequest(Target);
+    if (Request == NULL)
+        return FALSE;
+    InterlockedIncrement(&SrbExt->RequestCount);
 
-    Requests = QueueCount(&Target->SubmittedReqs);
-    KeMemoryBarrier();
+    Request->SrbExt     = SrbExt;
+    Request->Operation  = Operation;
+    Request->FirstSector = Cdb_LogicalBlock(Srb);
 
-    Verbose("Target[%d] : Waiting for %d Submitted requests\n", TargetGetTargetId(Target), Requests);
+    Srb->SrbStatus = SRB_STATUS_PENDING;
 
-    // poll ring and send event channel notification every 1ms (for up to 3 minutes)
-    while (QueueCount(&Target->SubmittedReqs)) {
-        if (Timeout && Count > 180000)
-            break;
-        KeRaiseIrql(DISPATCH_LEVEL, &Irql);
-        BlockRingPoll(BlockRing);
-        KeLowerIrql(Irql);
-        NotifierSend(Notifier);         // let backend know it needs to do some work
-        StorPortStallExecution(1000);   // 1000 micro-seconds
-        ++Count;
-    }
+    KeAcquireSpinLock(&Target->QueueLock, &Irql);
+    InsertTailList(&Target->Prepared, &Request->ListEntry);
+    KeReleaseSpinLock(&Target->QueueLock, Irql);
 
-    Verbose("Target[%d] : %u/%u Submitted requests left (%u iterrations)\n",
-            TargetGetTargetId(Target), QueueCount(&Target->SubmittedReqs), Requests, Count);
-
-    // Abort Fresh SRBs
-    for (;;) {
-        PXENVBD_SRBEXT  SrbExt;
-        PLIST_ENTRY     ListEntry = QueuePop(&Target->FreshSrbs);
-        if (ListEntry == NULL)
-            break;
-        SrbExt = CONTAINING_RECORD(ListEntry, XENVBD_SRBEXT, ListEntry);
-
-        Verbose("Target[%d] : FreshSrb 0x%p -> SCSI_ABORTED\n", TargetGetTargetId(Target), SrbExt->Srb);
-        SrbExt->Srb->SrbStatus = SRB_STATUS_ABORTED;
-        SrbExt->Srb->ScsiStatus = 0x40; // SCSI_ABORTED;
-        AdapterCompleteSrb(TargetGetAdapter(Target), SrbExt);
-    }
-
-    // Fail PreparedReqs
-    for (;;) {
-        PXENVBD_SRBEXT  SrbExt;
-        PXENVBD_REQUEST Request;
-        PLIST_ENTRY     Entry = QueuePop(&Target->PreparedReqs);
-        if (Entry == NULL)
-            break;
-        Request = CONTAINING_RECORD(Entry, XENVBD_REQUEST, Entry);
-        SrbExt = Request->Srb->SrbExtension;
-
-        Verbose("Target[%d] : PreparedReq 0x%p -> FAILED\n", TargetGetTargetId(Target), Request);
-
-        SrbExt->Srb->SrbStatus = SRB_STATUS_ABORTED;
-        TargetPutRequest(Target, Request);
-
-        if (InterlockedDecrement(&SrbExt->RequestCount) == 0) {
-            SrbExt->Srb->ScsiStatus = 0x40; // SCSI_ABORTED
-            AdapterCompleteSrb(TargetGetAdapter(Target), SrbExt);
-        }
-    }
+    return TRUE;
 }
 
-static FORCEINLINE VOID
-__TargetUnpauseDataPath(
-    __in PXENVBD_TARGET             Target
+static BOOLEAN
+TargetPrepareRequest(
+    IN  PXENVBD_TARGET  Target,
+    IN  PXENVBD_SRBEXT  SrbExt
     )
 {
-    KIRQL   Irql;
+    PSCSI_REQUEST_BLOCK Srb = SrbExt->Srb;
+    UCHAR               Operation;
 
-    KeAcquireSpinLock(&Target->Lock, &Irql);
-    --Target->Paused;
-    KeReleaseSpinLock(&Target->Lock, Irql);
-}
-
-static FORCEINLINE BOOLEAN
-TargetPrepareFresh(
-    IN  PXENVBD_TARGET         Target
-    )
-{
-    PXENVBD_SRBEXT  SrbExt;
-    PLIST_ENTRY     ListEntry;
-
-    ListEntry = QueuePop(&Target->FreshSrbs);
-    if (ListEntry == NULL)
-        return FALSE;   // fresh queue is empty
-
-    SrbExt = CONTAINING_RECORD(ListEntry, XENVBD_SRBEXT, ListEntry);
-
-    switch (Cdb_OperationEx(SrbExt->Srb)) {
+    Operation = Cdb_OperationEx(SrbExt->Srb);
+    switch (Operation) {
     case SCSIOP_READ:
+        return TargetPrepareRW(Target, SrbExt, BLKIF_OP_READ);
+
     case SCSIOP_WRITE:
-        if (PrepareReadWrite(Target, SrbExt->Srb))
-            return TRUE;    // prepared this SRB
-        break;
-    case SCSIOP_SYNCHRONIZE_CACHE:
-        if (PrepareSyncCache(Target, SrbExt->Srb))
-            return TRUE;    // prepared this SRB
-        break;
+        return TargetPrepareRW(Target, SrbExt, BLKIF_OP_WRITE);
+
     case SCSIOP_UNMAP:
-        if (PrepareUnmap(Target, SrbExt->Srb))
-            return TRUE;    // prepared this SRB
-        break;
+        return TargetPrepareUnmap(Target, SrbExt);
+
+    case SCSIOP_SYNCHRONIZE_CACHE:
+        if (Target->FeatureFlush)
+            return TargetPrepareSync(Target, SrbExt, BLKIF_OP_FLUSH_DISKCACHE);
+        if (Target->FeatureBarrier)
+            return TargetPrepareSync(Target, SrbExt, BLKIF_OP_WRITE_BARRIER);
+        
+        // nothing supported - shouldnt really get here, but just complete if it did
+        Warning("[%u] FLUSH & BARRIER not supported, SCSIOP_SYNCHRONIZE_CACHE got to Prepare\n",
+                Target->TargetId);
+        Srb->SrbStatus = SRB_STATUS_SUCCESS;
+        AdapterCompleteSrb(Target->Adapter, SrbExt);
+        return TRUE;
+
     default:
         ASSERT(FALSE);
         break;
     }
-    QueueUnPop(&Target->FreshSrbs, &SrbExt->ListEntry);
+    return FALSE;
+}
 
-    return FALSE;       // prepare failed
+static FORCEINLINE BOOLEAN
+TargetPrepareFresh(
+    IN  PXENVBD_TARGET  Target
+    ) 
+{
+    PXENVBD_SRBEXT      SrbExt;
+    PLIST_ENTRY         ListEntry;
+    KIRQL               Irql;
+
+    KeAcquireSpinLock(&Target->QueueLock, &Irql);
+    ListEntry = RemoveHeadList(&Target->Fresh);
+    if (ListEntry == &Target->Fresh) {
+        KeReleaseSpinLock(&Target->QueueLock, Irql);
+        return FALSE;
+    }
+    KeReleaseSpinLock(&Target->QueueLock, Irql);
+
+    SrbExt = CONTAINING_RECORD(ListEntry, XENVBD_SRBEXT, ListEntry);
+
+    if (TargetPrepareRequest(Target, SrbExt))
+        return TRUE;
+
+    KeAcquireSpinLock(&Target->QueueLock, &Irql);
+    InsertHeadList(&Target->Fresh, ListEntry);
+    KeReleaseSpinLock(&Target->QueueLock, Irql);
+
+    return FALSE;
 }
 
 static FORCEINLINE BOOLEAN
 TargetSubmitPrepared(
-    __in PXENVBD_TARGET             Target
+    IN  PXENVBD_TARGET  Target
     )
 {
-    PXENVBD_BLOCKRING   BlockRing = FrontendGetBlockRing(Target->Frontend);
-    if (TargetIsPaused(Target)) {
-        if (QueueCount(&Target->PreparedReqs))
-            Warning("Target[%d] : Paused, not submitting new requests (%u)\n",
-                    TargetGetTargetId(Target),
-                    QueueCount(&Target->PreparedReqs));
-        return FALSE;
-    }
-
     for (;;) {
+        PLIST_ENTRY     ListEntry;
         PXENVBD_REQUEST Request;
-        PLIST_ENTRY     Entry;
+        KIRQL           Irql;
 
-        Entry = QueuePop(&Target->PreparedReqs);
-        if (Entry == NULL)
+        KeAcquireSpinLock(&Target->QueueLock, &Irql);
+        ListEntry = RemoveHeadList(&Target->Prepared);
+        if (ListEntry == &Target->Prepared) {
+            KeReleaseSpinLock(&Target->QueueLock, Irql);
             break;
+        }
+        Request = CONTAINING_RECORD(ListEntry, XENVBD_REQUEST, ListEntry);
 
-        Request = CONTAINING_RECORD(Entry, XENVBD_REQUEST, Entry);
+        InsertTailList(&Target->Submitted, ListEntry);
+        KeReleaseSpinLock(&Target->QueueLock, Irql);
 
-        QueueAppend(&Target->SubmittedReqs, &Request->Entry);
-        KeMemoryBarrier();
-
-        if (BlockRingSubmit(BlockRing, Request))
+        if (BlockRingSubmit(Target->BlockRing, Request))
             continue;
 
-        QueueRemove(&Target->SubmittedReqs, &Request->Entry);
-        QueueUnPop(&Target->PreparedReqs, &Request->Entry);
-        return FALSE;   // ring full
+        KeAcquireSpinLock(&Target->QueueLock, &Irql);
+        RemoveEntryList(&Request->ListEntry);
+        InsertHeadList(&Target->Prepared, &Request->ListEntry);
+        KeReleaseSpinLock(&Target->QueueLock, Irql);
+
+        return FALSE;
     }
 
     return TRUE;
@@ -1451,48 +884,40 @@ TargetSubmitPrepared(
 
 static FORCEINLINE VOID
 TargetCompleteShutdown(
-    __in PXENVBD_TARGET             Target
+    IN  PXENVBD_TARGET  Target
     )
 {
-    if (QueueCount(&Target->ShutdownSrbs) == 0)
+    if (IsListEmpty(&Target->Shutdown))
         return;
-
-    if (QueueCount(&Target->FreshSrbs) ||
-        QueueCount(&Target->PreparedReqs) ||
-        QueueCount(&Target->SubmittedReqs))
+    if (!IsListEmpty(&Target->Fresh))
+        return;
+    if (!IsListEmpty(&Target->Prepared))
+        return;
+    if (!IsListEmpty(&Target->Shutdown))
         return;
 
     for (;;) {
+        PLIST_ENTRY     ListEntry;
         PXENVBD_SRBEXT  SrbExt;
-        PLIST_ENTRY     ListEntry = QueuePop(&Target->ShutdownSrbs);
-        if (ListEntry == NULL)
+        KIRQL           Irql;
+
+        KeAcquireSpinLock(&Target->QueueLock, &Irql);
+        ListEntry = RemoveHeadList(&Target->Shutdown);
+        if (ListEntry == &Target->Shutdown) {
+            KeReleaseSpinLock(&Target->QueueLock, Irql);
             break;
+        }
+        KeReleaseSpinLock(&Target->QueueLock, Irql);
+
         SrbExt = CONTAINING_RECORD(ListEntry, XENVBD_SRBEXT, ListEntry);
         SrbExt->Srb->SrbStatus = SRB_STATUS_SUCCESS;
         AdapterCompleteSrb(TargetGetAdapter(Target), SrbExt);
     }
 }
 
-static FORCEINLINE PCHAR
-BlkifOperationName(
-    IN  UCHAR                   Operation
-    )
-{
-    switch (Operation) {
-    case BLKIF_OP_READ:             return "READ";
-    case BLKIF_OP_WRITE:            return "WRITE";
-    case BLKIF_OP_WRITE_BARRIER:    return "WRITE_BARRIER";
-    case BLKIF_OP_FLUSH_DISKCACHE:  return "FLUSH_DISKCACHE";
-    case BLKIF_OP_RESERVED_1:       return "RESERVED_1";
-    case BLKIF_OP_DISCARD:          return "DISCARD";
-    case BLKIF_OP_INDIRECT:         return "INDIRECT";
-    default:                        return "<unknown>";
-    }
-}
-
 VOID
 TargetSubmitRequests(
-    __in PXENVBD_TARGET             Target
+    IN  PXENVBD_TARGET  Target
     )
 {
     for (;;) {
@@ -1513,374 +938,380 @@ TargetSubmitRequests(
     TargetCompleteShutdown(Target);
 }
 
-VOID
-TargetCompleteResponse(
-    __in PXENVBD_TARGET             Target,
-    __in ULONG                   Tag,
-    __in SHORT                   Status
+static FORCEINLINE VOID
+TargetDisableFeature(
+    IN  PXENVBD_TARGET  Target,
+    IN  UCHAR           Operation
     )
 {
+    switch (Operation) {
+    case BLKIF_OP_WRITE_BARRIER:
+        Target->FeatureBarrier = FALSE;
+        break;
+    case BLKIF_OP_FLUSH_DISKCACHE:
+        Target->FeatureFlush = FALSE;
+        break;
+    case BLKIF_OP_DISCARD:
+        Target->FeatureDiscard = FALSE;
+        break;
+    default:
+        break;
+    }
+}
+
+VOID
+TargetCompleteResponse(
+    IN  PXENVBD_TARGET  Target,
+    IN  ULONG64         Id,
+    IN  SHORT           Status
+    )
+{
+    PLIST_ENTRY         ListEntry;
     PXENVBD_REQUEST     Request;
-    PSCSI_REQUEST_BLOCK Srb;
     PXENVBD_SRBEXT      SrbExt;
+    PSCSI_REQUEST_BLOCK Srb;
+    KIRQL               Irql;
 
-    Request = TargetRequestFromTag(Target, Tag);
-    if (Request == NULL)
-        return;
+    KeAcquireSpinLock(&Target->QueueLock, &Irql);
+    Request = NULL;
+    for (ListEntry = Target->Submitted.Flink;
+         ListEntry != &Target->Submitted;
+         ListEntry = ListEntry->Flink) {
+        Request = CONTAINING_RECORD(ListEntry, XENVBD_REQUEST, ListEntry);
 
-    Srb     = Request->Srb;
-    SrbExt  = Srb->SrbExtension;
+        if (Request->Id == Id) {
+            RemoveEntryList(&Request->ListEntry);
+
+            ASSERT3P(Request, ==, (PVOID)(ULONG_PTR)Id);
+            break;
+        }
+
+        Request = NULL;
+    }
+    KeReleaseSpinLock(&Target->QueueLock, Irql);
+
+    ASSERT3P(Request, !=, NULL);
+    SrbExt = Request->SrbExt;
     ASSERT3P(SrbExt, !=, NULL);
+    Srb = SrbExt->Srb;
+    ASSERT3P(Srb, !=, NULL);
 
     switch (Status) {
     case BLKIF_RSP_OKAY:
-        RequestCopyOutput(Request);
-        break;
+        if (Request->Operation == BLKIF_OP_READ) {
+            for (ListEntry = Request->Segments.Flink;
+                 ListEntry != &Request->Segments;
+                 ListEntry = ListEntry->Flink) {
+                PXENVBD_SEGMENT Segment = CONTAINING_RECORD(ListEntry, XENVBD_SEGMENT, ListEntry);
 
+                if (Segment->BufferId) {
+                    ASSERT(Segment->Buffer);
+                    ASSERT(Segment->Length);
+                    BufferCopyOut(Segment->BufferId,
+                                  Segment->Buffer,
+                                  Segment->Length);
+                }
+            }
+        }
+        break;
     case BLKIF_RSP_EOPNOTSUPP:
-        // Remove appropriate feature support
-        FrontendRemoveFeature(Target->Frontend, Request->Operation);
-        // Succeed this SRB, subsiquent SRBs will be succeeded instead of being passed to the backend.
-        Srb->SrbStatus = SRB_STATUS_SUCCESS;
+        TargetDisableFeature(Target, Request->Operation);
         break;
-
     case BLKIF_RSP_ERROR:
     default:
-        Warning("Target[%d] : %s BLKIF_RSP_ERROR (Tag %x)\n",
-                TargetGetTargetId(Target), BlkifOperationName(Request->Operation), Tag);
         Srb->SrbStatus = SRB_STATUS_ERROR;
         break;
     }
 
     TargetPutRequest(Target, Request);
 
-    // complete srb
-    if (InterlockedDecrement(&SrbExt->RequestCount) == 0) {
-        if (Srb->SrbStatus == SRB_STATUS_PENDING) {
-            // SRB has not hit a failure condition (BLKIF_RSP_ERROR | BLKIF_RSP_EOPNOTSUPP)
-            // from any of its responses. SRB must have succeeded
-            Srb->SrbStatus = SRB_STATUS_SUCCESS;
-            Srb->ScsiStatus = 0x00; // SCSI_GOOD
-        } else {
-            // Srb->SrbStatus has already been set by 1 or more requests with Status != BLKIF_RSP_OKAY
-            Srb->ScsiStatus = 0x40; // SCSI_ABORTED
-        }
-
-        AdapterCompleteSrb(TargetGetAdapter(Target), SrbExt);
-    }
-}
-
-VOID
-TargetPreResume(
-    __in PXENVBD_TARGET             Target
-    )
-{
-    LIST_ENTRY          List;
-
-    InitializeListHead(&List);
-
-    // pop all submitted requests, cleanup and add associated SRB to a list
-    for (;;) {
-        PXENVBD_SRBEXT  SrbExt;
-        PXENVBD_REQUEST Request;
-        PLIST_ENTRY     Entry = QueuePop(&Target->SubmittedReqs);
-        if (Entry == NULL)
-            break;
-        Request = CONTAINING_RECORD(Entry, XENVBD_REQUEST, Entry);
-        SrbExt = Request->Srb->SrbExtension;
-
-        TargetPutRequest(Target, Request);
-
-        if (InterlockedDecrement(&SrbExt->RequestCount) == 0) {
-            InsertTailList(&List, &SrbExt->ListEntry);
-        }
-    }
-
-    // pop all prepared requests, cleanup and add associated SRB to a list
-    for (;;) {
-        PXENVBD_SRBEXT  SrbExt;
-        PXENVBD_REQUEST Request;
-        PLIST_ENTRY     Entry = QueuePop(&Target->PreparedReqs);
-        if (Entry == NULL)
-            break;
-        Request = CONTAINING_RECORD(Entry, XENVBD_REQUEST, Entry);
-        SrbExt = Request->Srb->SrbExtension;
-
-        TargetPutRequest(Target, Request);
-
-        if (InterlockedDecrement(&SrbExt->RequestCount) == 0) {
-            InsertTailList(&List, &SrbExt->ListEntry);
-        }
-    }
-
-    // foreach SRB in list, put on start of FreshSrbs
-    for (;;) {
-        PXENVBD_SRBEXT  SrbExt;
-        PLIST_ENTRY     ListEntry = RemoveTailList(&List);
-        if (ListEntry == &List)
-            break;
-        SrbExt = CONTAINING_RECORD(ListEntry, XENVBD_SRBEXT, ListEntry);
-
-        QueueUnPop(&Target->FreshSrbs, &SrbExt->ListEntry);
-    }
-
-    // now the first set of requests popped off submitted list is the next SRB 
-    // to be popped off the fresh list
-}
-
-VOID
-TargetPostResume(
-    __in PXENVBD_TARGET             Target
-    )
-{
-    KIRQL   Irql;
-
-    Verbose("Target[%d] : %d Fresh SRBs\n", TargetGetTargetId(Target), QueueCount(&Target->FreshSrbs));
-    
-    // clear missing flag
-    KeAcquireSpinLock(&Target->Lock, &Irql);
-    Verbose("Target[%d] : %s (%s)\n", TargetGetTargetId(Target), Target->Missing ? "MISSING" : "NOT_MISSING", Target->Reason);
-    Target->Missing = FALSE;
-    Target->Reason = NULL;
-    KeReleaseSpinLock(&Target->Lock, Irql);
-}
-
-//=============================================================================
-// SRBs
-__checkReturn
-static FORCEINLINE BOOLEAN
-__ValidateSectors(
-    __in ULONG64                 SectorCount,
-    __in ULONG64                 Start,
-    __in ULONG                   Length
-    )
-{
-    // Deal with overflow
-    return (Start < SectorCount) && ((Start + Length) <= SectorCount);
-}
-
-__checkReturn
-static FORCEINLINE BOOLEAN
-__ValidateSrbBuffer(
-    __in PCHAR                  Caller,
-    __in PSCSI_REQUEST_BLOCK    Srb,
-    __in ULONG                  MinLength
-    )
-{
-    if (Srb->DataBuffer == NULL) {
-        Error("%s: Srb[0x%p].DataBuffer = NULL\n", Caller, Srb);
-        return FALSE;
-    }
-    if (MinLength) {
-        if (Srb->DataTransferLength < MinLength) {
-            Error("%s: Srb[0x%p].DataTransferLength < %d\n", Caller, Srb, MinLength);
-            return FALSE;
-        }
-    } else {
-        if (Srb->DataTransferLength == 0) {
-            Error("%s: Srb[0x%p].DataTransferLength = 0\n", Caller, Srb);
-            return FALSE;
-        }
-    }
-
-    return TRUE;
-}
-
-static DECLSPEC_NOINLINE VOID
-TargetReadWrite(
-    IN  PXENVBD_TARGET      Target,
-    IN  PXENVBD_SRBEXT      SrbExt
-    )
-{
-    PSCSI_REQUEST_BLOCK     Srb = SrbExt->Srb;
-    PXENVBD_DISKINFO        DiskInfo = FrontendGetDiskInfo(Target->Frontend);
-    PXENVBD_NOTIFIER        Notifier = FrontendGetNotifier(Target->Frontend);
-
-    if (FrontendGetCaps(Target->Frontend)->Connected == FALSE) {
-        Trace("Target[%d] : Not Ready, fail SRB\n", TargetGetTargetId(Target));
-        Srb->ScsiStatus = 0x40; // SCSI_ABORT;
-        Srb->SrbStatus = SRB_STATUS_ERROR;
+    if (InterlockedDecrement(&SrbExt->RequestCount) != 0)
         return;
-    }
 
-    // check valid sectors
-    if (!__ValidateSectors(DiskInfo->SectorCount, Cdb_LogicalBlock(Srb), Cdb_TransferBlock(Srb))) {
-        Trace("Target[%d] : Invalid Sector (%d @ %lld < %lld)\n", TargetGetTargetId(Target), Cdb_TransferBlock(Srb), Cdb_LogicalBlock(Srb), DiskInfo->SectorCount);
-        Srb->ScsiStatus = 0x40; // SCSI_ABORT
-        Srb->SrbStatus = SRB_STATUS_ERROR;
-        return; // Complete now
-    }
-
-    QueueAppend(&Target->FreshSrbs, &SrbExt->ListEntry);
-    NotifierKick(Notifier);
-}
-
-static DECLSPEC_NOINLINE VOID
-TargetSyncCache(
-    IN  PXENVBD_TARGET      Target,
-    IN  PXENVBD_SRBEXT      SrbExt
-    )
-{
-    PSCSI_REQUEST_BLOCK     Srb = SrbExt->Srb;
-    PXENVBD_NOTIFIER        Notifier = FrontendGetNotifier(Target->Frontend);
-
-    if (FrontendGetCaps(Target->Frontend)->Connected == FALSE) {
-        Trace("Target[%d] : Not Ready, fail SRB\n", TargetGetTargetId(Target));
-        Srb->ScsiStatus = 0x40; // SCSI_ABORT;
-        Srb->SrbStatus = SRB_STATUS_ERROR;
-        return;
-    }
-
-    if (FrontendGetDiskInfo(Target->Frontend)->FlushCache == FALSE &&
-        FrontendGetDiskInfo(Target->Frontend)->Barrier == FALSE) {
-        Trace("Target[%d] : FLUSH and BARRIER not supported, suppressing\n", TargetGetTargetId(Target));
-        Srb->ScsiStatus = 0x00; // SCSI_GOOD
+    if (Srb->SrbStatus == SRB_STATUS_PENDING)
         Srb->SrbStatus = SRB_STATUS_SUCCESS;
-        return;
-    }
 
-    QueueAppend(&Target->FreshSrbs, &SrbExt->ListEntry);
-    NotifierKick(Notifier);
+    AdapterCompleteSrb(Target->Adapter, SrbExt);
 }
 
-static DECLSPEC_NOINLINE VOID
-TargetUnmap(
-    IN  PXENVBD_TARGET      Target,
-    IN  PXENVBD_SRBEXT      SrbExt
+VOID
+TargetReset(
+    IN  PXENVBD_TARGET  Target
+    )
+{
+    ULONG               Outstanding;
+
+    Verbose("[%u] =====>\n", Target->TargetId);
+
+    ASSERT3U(KeGetCurrentIrql(), ==, DISPATCH_LEVEL);
+
+    Trace("polling...\n");
+    Outstanding = BlockRingPoll(Target->BlockRing);
+    Trace("%u requests outstanding\n", Outstanding);
+
+    Verbose("[%u] <=====\n", Target->TargetId);
+}
+
+VOID
+TargetFlush(
+    IN  PXENVBD_TARGET  Target,
+    IN  PXENVBD_SRBEXT  SrbExt
+    )
+{
+    KIRQL               Irql;
+
+    SrbExt->Srb->SrbStatus = SRB_STATUS_PENDING;
+
+    KeAcquireSpinLock(&Target->QueueLock, &Irql);
+    InsertTailList(&Target->Shutdown, &SrbExt->ListEntry);
+    KeReleaseSpinLock(&Target->QueueLock, Irql);
+
+    BlockRingKick(Target->BlockRing);
+}
+
+VOID
+TargetShutdown(
+    IN  PXENVBD_TARGET  Target,
+    IN  PXENVBD_SRBEXT  SrbExt
+    )
+{
+    KIRQL               Irql;
+
+    SrbExt->Srb->SrbStatus = SRB_STATUS_PENDING;
+
+    KeAcquireSpinLock(&Target->QueueLock, &Irql);
+    InsertTailList(&Target->Shutdown, &SrbExt->ListEntry);
+    KeReleaseSpinLock(&Target->QueueLock, Irql);
+
+    BlockRingKick(Target->BlockRing);
+}
+
+VOID
+TargetPrepareSrb(
+    IN  PXENVBD_TARGET  Target,
+    IN  PXENVBD_SRBEXT  SrbExt
     )
 {
     PSCSI_REQUEST_BLOCK Srb = SrbExt->Srb;
-    PXENVBD_NOTIFIER    Notifier = FrontendGetNotifier(Target->Frontend);
 
-    if (FrontendGetCaps(Target->Frontend)->Connected == FALSE) {
-        Trace("Target[%d] : Not Ready, fail SRB\n", TargetGetTargetId(Target));
-        Srb->ScsiStatus = 0x40; // SCSI_ABORT;
-        Srb->SrbStatus = SRB_STATUS_ERROR;
-        return;
-    }
+    UNREFERENCED_PARAMETER(Target);
 
-    if (FrontendGetDiskInfo(Target->Frontend)->Discard == FALSE) {
-        Trace("Target[%d] : DISCARD not supported, suppressing\n", TargetGetTargetId(Target));
-        Srb->ScsiStatus = 0x00; // SCSI_GOOD
-        Srb->SrbStatus = SRB_STATUS_SUCCESS;
-        return;
-    }
-
-    QueueAppend(&Target->FreshSrbs, &SrbExt->ListEntry);
-    NotifierKick(Notifier);
+    Srb->SrbStatus = SRB_STATUS_PENDING;
 }
 
-#define MODE_CACHING_PAGE_LENGTH 20
-static DECLSPEC_NOINLINE VOID
+static FORCEINLINE VOID
+TargetQueueSrb(
+    IN  PXENVBD_TARGET  Target,
+    IN  PXENVBD_SRBEXT  SrbExt
+    )
+{
+    KIRQL               Irql;
+
+    SrbExt->Srb->SrbStatus = SRB_STATUS_PENDING;
+
+    KeAcquireSpinLock(&Target->QueueLock, &Irql);
+    InsertTailList(&Target->Fresh, &SrbExt->ListEntry);
+    KeReleaseSpinLock(&Target->QueueLock, Irql);
+
+    BlockRingKick(Target->BlockRing);
+}
+
+static FORCEINLINE VOID
+TargetInquiryStd(
+    IN  PXENVBD_TARGET  Target,
+    IN  PXENVBD_SRBEXT  SrbExt
+    )
+{
+    PSCSI_REQUEST_BLOCK Srb = SrbExt->Srb;
+    PINQUIRYDATA        Data = Srb->DataBuffer;
+   
+    UNREFERENCED_PARAMETER(Target);
+
+    Srb->SrbStatus = SRB_STATUS_DATA_OVERRUN;
+    if (Srb->DataTransferLength < sizeof(INQUIRYDATA))
+        return;
+
+    RtlZeroMemory(Data, Srb->DataTransferLength);
+    Data->DeviceType            = DIRECT_ACCESS_DEVICE;
+    Data->DeviceTypeQualifier   = DEVICE_CONNECTED;
+    Data->Versions              = 4;
+    Data->ResponseDataFormat    = 2;
+    Data->AdditionalLength      = INQUIRYDATABUFFERSIZE - 4;
+    Data->CommandQueue          = 1;
+    RtlCopyMemory(Data->VendorId,               "XENSRC  ", 8);
+    RtlCopyMemory(Data->ProductId,              "PVDISK          ", 16);
+    RtlCopyMemory(Data->ProductRevisionLevel,   "3.0 ", 4);
+
+    Srb->DataTransferLength = sizeof(INQUIRYDATA);
+    Srb->SrbStatus = SRB_STATUS_SUCCESS;
+}
+
+static FORCEINLINE VOID
+TargetInquiry00(
+    IN  PXENVBD_TARGET  Target,
+    IN  PXENVBD_SRBEXT  SrbExt
+    )
+{
+    PSCSI_REQUEST_BLOCK Srb = SrbExt->Srb;
+    PUCHAR              Data = Srb->DataBuffer;
+
+    UNREFERENCED_PARAMETER(Target);
+
+    Srb->SrbStatus = SRB_STATUS_DATA_OVERRUN;
+    if (Srb->DataTransferLength < 7)
+        return;
+
+    RtlZeroMemory(Data, Srb->DataTransferLength);
+    Data[3] = 3;
+    Data[5] = 0x80;
+    Data[6] = 0x83;
+
+    Srb->DataTransferLength = 7;
+    Srb->SrbStatus = SRB_STATUS_SUCCESS;
+}
+
+static FORCEINLINE VOID
+TargetInquiry80(
+    IN  PXENVBD_TARGET      Target,
+    IN  PXENVBD_SRBEXT      SrbExt
+    )
+{
+    PSCSI_REQUEST_BLOCK     Srb = SrbExt->Srb;
+    PVPD_SERIAL_NUMBER_PAGE Data = Srb->DataBuffer;
+   
+    Srb->SrbStatus = SRB_STATUS_DATA_OVERRUN;
+    if (Srb->DataTransferLength < sizeof(VPD_SERIAL_NUMBER_PAGE) + 4)
+        return;
+
+    RtlZeroMemory(Data, Srb->DataTransferLength);
+    Data->PageCode = 0x80;
+    Data->PageLength = 4;
+    RtlStringCchPrintfA((PCHAR)Data->SerialNumber, 4, "%04u", Target->TargetId);
+
+    Srb->DataTransferLength = sizeof(VPD_SERIAL_NUMBER_PAGE) + 4;
+    Srb->SrbStatus = SRB_STATUS_SUCCESS;
+}
+
+static FORCEINLINE VOID
+TargetInquiry83(
+    IN  PXENVBD_TARGET      Target,
+    IN  PXENVBD_SRBEXT      SrbExt
+    )
+{
+    PSCSI_REQUEST_BLOCK         Srb = SrbExt->Srb;
+    PVPD_IDENTIFICATION_PAGE    Data = Srb->DataBuffer;
+    PVPD_IDENTIFICATION_DESCRIPTOR  Descr;
+
+    Srb->SrbStatus = SRB_STATUS_DATA_OVERRUN;
+    if (Srb->DataTransferLength < sizeof(VPD_IDENTIFICATION_PAGE) - 1 +
+                                  sizeof(VPD_IDENTIFICATION_DESCRIPTOR) + 16)
+        return;
+
+    RtlZeroMemory(Data, Srb->DataTransferLength);
+    Data->PageCode = 0x83;
+    Data->PageLength = sizeof(VPD_IDENTIFICATION_DESCRIPTOR) + 16;
+
+    Descr = (PVPD_IDENTIFICATION_DESCRIPTOR)Data->Descriptors;
+    Descr->CodeSet          = VpdCodeSetAscii;
+    Descr->IdentifierType   = VpdIdentifierTypeVendorId;
+    Descr->IdentifierLength = 16;
+    RtlStringCbPrintfA((PCHAR)Descr->Identifier,
+                       16,
+                       "XEN:%u:%u",
+                       Target->DeviceId,
+                       Target->TargetId);
+
+    Srb->DataTransferLength = sizeof(VPD_IDENTIFICATION_PAGE) - 1 +
+                              sizeof(VPD_IDENTIFICATION_DESCRIPTOR) + 16;
+    Srb->SrbStatus = SRB_STATUS_SUCCESS;
+}
+
+static FORCEINLINE VOID
+TargetInquiry(
+    IN  PXENVBD_TARGET  Target,
+    IN  PXENVBD_SRBEXT  SrbExt
+    )
+{
+    if (Cdb_EVPD(SrbExt->Srb)) {
+        switch (Cdb_PageCode(SrbExt->Srb)) {
+        case 0x00:  TargetInquiry00(Target, SrbExt);            break;
+        case 0x80:  TargetInquiry80(Target, SrbExt);            break;
+        case 0x83:  TargetInquiry83(Target, SrbExt);            break;
+        default:    SrbExt->Srb->SrbStatus = SRB_STATUS_ERROR;  break;
+        }
+    } else {
+        switch (Cdb_PageCode(SrbExt->Srb)) {
+        case 0x00:  TargetInquiryStd(Target, SrbExt);           break;
+        default:    SrbExt->Srb->SrbStatus = SRB_STATUS_ERROR;  break;
+        }
+    }
+}
+
+static FORCEINLINE VOID
 TargetModeSense(
     IN  PXENVBD_TARGET      Target,
     IN  PXENVBD_SRBEXT      SrbExt
     )
 {
     PSCSI_REQUEST_BLOCK     Srb = SrbExt->Srb;
-    PMODE_PARAMETER_HEADER  Header = Srb->DataBuffer;
-    const UCHAR             PageCode = Cdb_PageCode(Srb);
-    ULONG                   LengthLeft = Cdb_AllocationLength(Srb);
-    PVOID                   CurrentPage = Srb->DataBuffer;
+    PMODE_PARAMETER_HEADER  Header;
+    ULONG                   Offset;
+    UCHAR                   PageCode;
 
     UNREFERENCED_PARAMETER(Target);
 
+    Srb->SrbStatus = SRB_STATUS_DATA_OVERRUN;
+    if (Srb->DataTransferLength < sizeof(MODE_PARAMETER_HEADER))
+        return;
     RtlZeroMemory(Srb->DataBuffer, Srb->DataTransferLength);
 
-    if (!__ValidateSrbBuffer(__FUNCTION__, Srb, (ULONG)sizeof(struct _MODE_SENSE))) {
-        Srb->ScsiStatus = 0x40;
-        Srb->SrbStatus = SRB_STATUS_DATA_OVERRUN;
-        Srb->DataTransferLength = 0;
-        return;
-    }
+    Header = Srb->DataBuffer;
+    Header->ModeDataLength = sizeof(MODE_PARAMETER_HEADER) - 1;
 
-    // TODO : CDROM requires more ModePage entries
-    // Header
-    Header->ModeDataLength  = sizeof(MODE_PARAMETER_HEADER) - 1;
-    Header->MediumType      = 0;
-    Header->DeviceSpecificParameter = 0;
-    Header->BlockDescriptorLength   = 0;
-    LengthLeft -= sizeof(MODE_PARAMETER_HEADER);
-    CurrentPage = ((PUCHAR)CurrentPage + sizeof(MODE_PARAMETER_HEADER));
-
-    // Fill in Block Parameters (if Specified and space)
-    // when the DBD (Disable Block Descriptor) is set, ignore the block page
-    if (Cdb_Dbd(Srb) == 0 && 
-        LengthLeft >= sizeof(MODE_PARAMETER_BLOCK)) {
-        PMODE_PARAMETER_BLOCK Block = (PMODE_PARAMETER_BLOCK)CurrentPage;
-        // Fill in BlockParams
-        Block->DensityCode                  =   0;
-        Block->NumberOfBlocks[0]            =   0;
-        Block->NumberOfBlocks[1]            =   0;
-        Block->NumberOfBlocks[2]            =   0;
-        Block->BlockLength[0]               =   0;
-        Block->BlockLength[1]               =   0;
-        Block->BlockLength[2]               =   0;
+    Offset = sizeof(MODE_PARAMETER_HEADER);
+    PageCode = Cdb_PageCode(Srb);
+    if (Cdb_Dbd(Srb) == 0 &&
+        Srb->DataTransferLength >= Offset + sizeof(MODE_PARAMETER_BLOCK)) {
+        PMODE_PARAMETER_BLOCK   Block = (PMODE_PARAMETER_BLOCK)((PUCHAR)Header + Offset);
+         
+        // Block is ZEROed
+        UNREFERENCED_PARAMETER(Block);
 
         Header->BlockDescriptorLength = sizeof(MODE_PARAMETER_BLOCK);
         Header->ModeDataLength += sizeof(MODE_PARAMETER_BLOCK);
-        LengthLeft -= sizeof(MODE_PARAMETER_BLOCK);
-        CurrentPage = ((PUCHAR)CurrentPage + sizeof(MODE_PARAMETER_BLOCK));
+        Offset += sizeof(MODE_PARAMETER_BLOCK);
     }
 
-    // Fill in Cache Parameters (if Specified and space)
     if ((PageCode == MODE_PAGE_CACHING || PageCode == MODE_SENSE_RETURN_ALL) &&
-        LengthLeft >= MODE_CACHING_PAGE_LENGTH) {
-        PMODE_CACHING_PAGE Caching = (PMODE_CACHING_PAGE)CurrentPage;
-        // Fill in CachingParams
-        Caching->PageCode                   = MODE_PAGE_CACHING;
-        Caching->PageSavable                = 0;
-        Caching->PageLength                 = MODE_CACHING_PAGE_LENGTH;
-        Caching->ReadDisableCache           = 0;
-        Caching->MultiplicationFactor       = 0;
-        Caching->WriteCacheEnable           = FrontendGetDiskInfo(Target->Frontend)->FlushCache ? 1 : 0;
-        Caching->WriteRetensionPriority     = 0;
-        Caching->ReadRetensionPriority      = 0;
-        Caching->DisablePrefetchTransfer[0] = 0;
-        Caching->DisablePrefetchTransfer[1] = 0;
-        Caching->MinimumPrefetch[0]         = 0;
-        Caching->MinimumPrefetch[1]         = 0;
-        Caching->MaximumPrefetch[0]         = 0;
-        Caching->MaximumPrefetch[1]         = 0;
-        Caching->MaximumPrefetchCeiling[0]  = 0;
-        Caching->MaximumPrefetchCeiling[1]  = 0;
+        Srb->DataTransferLength >= Offset + sizeof(MODE_CACHING_PAGE)) {
+        PMODE_CACHING_PAGE  Caching = (PMODE_CACHING_PAGE)((PUCHAR)Header + Offset);
 
-        Header->ModeDataLength += MODE_CACHING_PAGE_LENGTH;
-        LengthLeft -= MODE_CACHING_PAGE_LENGTH;
-        CurrentPage = ((PUCHAR)CurrentPage + MODE_CACHING_PAGE_LENGTH);
+        Caching->PageCode   = MODE_PAGE_CACHING;
+        Caching->PageLength = sizeof(MODE_CACHING_PAGE);
+        // Caching is ZEROed
+
+        Header->ModeDataLength += sizeof(MODE_CACHING_PAGE);
+        Offset += sizeof(MODE_CACHING_PAGE);
     }
 
-    // Fill in Informational Exception Parameters (if Specified and space)
     if ((PageCode == MODE_PAGE_FAULT_REPORTING || PageCode == MODE_SENSE_RETURN_ALL) &&
-        LengthLeft >= sizeof(MODE_INFO_EXCEPTIONS)) {
-        PMODE_INFO_EXCEPTIONS Exceptions = (PMODE_INFO_EXCEPTIONS)CurrentPage;
-        // Fill in Exceptions
-        Exceptions->PageCode                = MODE_PAGE_FAULT_REPORTING;
-        Exceptions->PSBit                   = 0;
-        Exceptions->PageLength              = sizeof(MODE_INFO_EXCEPTIONS);
-        Exceptions->Flags                   = 0;
-        Exceptions->Dexcpt                  = 1; // disabled
-        Exceptions->ReportMethod            = 0;
-        Exceptions->IntervalTimer[0]        = 0;
-        Exceptions->IntervalTimer[1]        = 0;
-        Exceptions->IntervalTimer[2]        = 0;
-        Exceptions->IntervalTimer[3]        = 0;
-        Exceptions->ReportCount[0]          = 0;
-        Exceptions->ReportCount[1]          = 0;
-        Exceptions->ReportCount[2]          = 0;
-        Exceptions->ReportCount[3]          = 0;
+        Srb->DataTransferLength >= Offset + sizeof(MODE_CACHING_PAGE)) {
+        PMODE_INFO_EXCEPTIONS  Info = (PMODE_INFO_EXCEPTIONS)((PUCHAR)Header + Offset);
 
-        Header->ModeDataLength += sizeof(MODE_INFO_EXCEPTIONS);
-        LengthLeft -= sizeof(MODE_INFO_EXCEPTIONS);
-        CurrentPage = ((PUCHAR)CurrentPage + sizeof(MODE_INFO_EXCEPTIONS));
+        Info->PageCode      = MODE_PAGE_FAULT_REPORTING;
+        Info->PageLength    = sizeof(MODE_INFO_EXCEPTIONS);
+        Info->Dexcpt        = 1;
+        // Info is ZEROed
+
+        Header->ModeDataLength += sizeof(MODE_CACHING_PAGE);
+        Offset += sizeof(MODE_CACHING_PAGE);
     }
 
-    // Finish this SRB
+    Srb->DataTransferLength = Offset;
     Srb->SrbStatus = SRB_STATUS_SUCCESS;
-    Srb->DataTransferLength = __min(Cdb_AllocationLength(Srb), (ULONG)(Header->ModeDataLength + 1));
 }
 
-static DECLSPEC_NOINLINE VOID
+static FORCEINLINE VOID
 TargetRequestSense(
     IN  PXENVBD_TARGET  Target,
     IN  PXENVBD_SRBEXT  SrbExt
@@ -1891,24 +1322,21 @@ TargetRequestSense(
 
     UNREFERENCED_PARAMETER(Target);
 
-    if (!__ValidateSrbBuffer(__FUNCTION__, Srb, (ULONG)sizeof(SENSE_DATA))) {
-        Srb->ScsiStatus = 0x40;
-        Srb->SrbStatus = SRB_STATUS_DATA_OVERRUN;
+    Srb->SrbStatus = SRB_STATUS_DATA_OVERRUN;
+    if (Srb->DataTransferLength < sizeof(SENSE_DATA))
         return;
-    }
-
-    RtlZeroMemory(Sense, sizeof(SENSE_DATA));
+    RtlZeroMemory(Srb->DataBuffer, Srb->DataTransferLength);
 
     Sense->ErrorCode            = 0x70;
     Sense->Valid                = 1;
-    Sense->AdditionalSenseCodeQualifier = 0;
     Sense->SenseKey             = SCSI_SENSE_NO_SENSE;
     Sense->AdditionalSenseCode  = SCSI_ADSENSE_NO_SENSE;
+
     Srb->DataTransferLength     = sizeof(SENSE_DATA);
     Srb->SrbStatus              = SRB_STATUS_SUCCESS;
 }
 
-static DECLSPEC_NOINLINE VOID
+static FORCEINLINE VOID
 TargetReportLuns(
     IN  PXENVBD_TARGET  Target,
     IN  PXENVBD_SRBEXT  SrbExt
@@ -1921,15 +1349,11 @@ TargetReportLuns(
     PUCHAR              Buffer = Srb->DataBuffer;
 
     UNREFERENCED_PARAMETER(Target);
-
-    if (!__ValidateSrbBuffer(__FUNCTION__, Srb, 8)) {
-        Srb->ScsiStatus = 0x40;
-        Srb->SrbStatus = SRB_STATUS_DATA_OVERRUN;
-        Srb->DataTransferLength = 0;
+     
+    Srb->SrbStatus = SRB_STATUS_DATA_OVERRUN;
+    if (Srb->DataTransferLength < 8)
         return;
-    }
-
-    RtlZeroMemory(Buffer, AllocLength);
+    RtlZeroMemory(Srb->DataBuffer, Srb->DataTransferLength);
 
     Length = 0;
     Offset = 8;
@@ -1952,41 +1376,40 @@ TargetReportLuns(
     Srb->SrbStatus = SRB_STATUS_SUCCESS;
 }
 
-static DECLSPEC_NOINLINE VOID
+static FORCEINLINE VOID
 TargetReadCapacity(
-    IN  PXENVBD_TARGET      Target,
-    IN  PXENVBD_SRBEXT      SrbExt
+    IN  PXENVBD_TARGET  Target,
+    IN  PXENVBD_SRBEXT  SrbExt
     )
 {
-    PSCSI_REQUEST_BLOCK     Srb = SrbExt->Srb;
-    PREAD_CAPACITY_DATA     Capacity = Srb->DataBuffer;
-    PXENVBD_DISKINFO        DiskInfo = FrontendGetDiskInfo(Target->Frontend);
-    ULONG64                 SectorCount;
-    ULONG                   SectorSize;
-    ULONG                   LastBlock;
+    PSCSI_REQUEST_BLOCK Srb = SrbExt->Srb;
+    PREAD_CAPACITY_DATA Capacity = Srb->DataBuffer;
+    ULONG64             SectorCount = Target->SectorCount;
+    ULONG               SectorSize = Target->SectorSize;
+    ULONG               LastBlock;
 
-    if (Cdb_PMI(Srb) == 0 && Cdb_LogicalBlock(Srb) != 0) {
-        Srb->ScsiStatus = 0x02; // CHECK_CONDITION
+    Srb->SrbStatus = SRB_STATUS_DATA_OVERRUN;
+    if (Srb->DataTransferLength < sizeof(READ_CAPACITY_DATA))
         return;
-    }
-    
-    SectorCount = DiskInfo->SectorCount;
-    SectorSize = DiskInfo->SectorSize;
+    RtlZeroMemory(Srb->DataBuffer, Srb->DataTransferLength);
+
+    Srb->SrbStatus = SRB_STATUS_ERROR;
+    if (Cdb_PMI(Srb) == 0 && Cdb_LogicalBlock(Srb) != 0)
+        return;
 
     if (SectorCount == (ULONG)SectorCount)
         LastBlock = (ULONG)SectorCount - 1;
     else
-        LastBlock = ~(ULONG)0;
+        LastBlock = ~0ul;
 
-    if (Capacity) {
-        Capacity->LogicalBlockAddress = _byteswap_ulong(LastBlock);
-        Capacity->BytesPerBlock = _byteswap_ulong(SectorSize);
-    }
+    Capacity->LogicalBlockAddress   = _byteswap_ulong(LastBlock);
+    Capacity->BytesPerBlock         = _byteswap_ulong(SectorSize);
 
-    Srb->SrbStatus = SRB_STATUS_SUCCESS;
+    Srb->DataTransferLength = sizeof(READ_CAPACITY_DATA);
+    Srb->SrbStatus = SRB_STATUS_SUCCESS; 
 }
 
-static DECLSPEC_NOINLINE VOID
+static FORCEINLINE VOID
 TargetReadCapacity16(
     IN  PXENVBD_TARGET      Target,
     IN  PXENVBD_SRBEXT      SrbExt
@@ -1994,84 +1417,47 @@ TargetReadCapacity16(
 {
     PSCSI_REQUEST_BLOCK     Srb = SrbExt->Srb;
     PREAD_CAPACITY16_DATA   Capacity = Srb->DataBuffer;
-    PXENVBD_DISKINFO        DiskInfo = FrontendGetDiskInfo(Target->Frontend);
-    ULONG64                 SectorCount;
-    ULONG                   SectorSize;
-    ULONG                   PhysSectorSize;
-    ULONG                   LogicalPerPhysical;
-    ULONG                   LogicalPerPhysicalExponent;
+    ULONG64                 SectorCount = Target->SectorCount;
+    ULONG                   SectorSize = Target->SectorSize;
+    ULONG                   LogPerPhysExp;
 
-    if (Cdb_PMI(Srb) == 0 && Cdb_LogicalBlock(Srb) != 0) {
-        Srb->ScsiStatus = 0x02; // CHECK_CONDITION
+    Srb->SrbStatus = SRB_STATUS_DATA_OVERRUN;
+    if (Srb->DataTransferLength < sizeof(READ_CAPACITY16_DATA))
         return;
-    }
+    RtlZeroMemory(Srb->DataBuffer, Srb->DataTransferLength);
 
-    SectorCount = DiskInfo->SectorCount;
-    SectorSize = DiskInfo->SectorSize;
-    PhysSectorSize = DiskInfo->PhysSectorSize;
+    Srb->SrbStatus = SRB_STATUS_ERROR;
+    if (Cdb_PMI(Srb) == 0 && Cdb_LogicalBlock(Srb) != 0)
+        return;
 
-    LogicalPerPhysical = PhysSectorSize / SectorSize;
+    if (Target->PhysicalSectorSize == 0)
+        LogPerPhysExp = 0;
+    else if (!_BitScanReverse(&LogPerPhysExp, Target->PhysicalSectorSize / SectorSize))
+        LogPerPhysExp = 0;
 
-    if (!_BitScanReverse(&LogicalPerPhysicalExponent, LogicalPerPhysical))
-        LogicalPerPhysicalExponent = 0;
+    Capacity->LogicalBlockAddress.QuadPart  = _byteswap_uint64(SectorCount - 1);
+    Capacity->BytesPerBlock                 = _byteswap_ulong(SectorSize);
+    Capacity->LogicalPerPhysicalExponent    = (UCHAR)LogPerPhysExp;
 
-    if (Capacity) {
-        Capacity->LogicalBlockAddress.QuadPart = _byteswap_uint64(SectorCount - 1);
-        Capacity->BytesPerBlock = _byteswap_ulong(SectorSize);
-        Capacity->LogicalPerPhysicalExponent = (UCHAR)LogicalPerPhysicalExponent;
-    }
-
+    Srb->DataTransferLength = sizeof(READ_CAPACITY16_DATA);
     Srb->SrbStatus = SRB_STATUS_SUCCESS;
 }
 
-static FORCEINLINE VOID
-__TargetQueueShutdown(
+static FORCEINLINE BOOLEAN
+TargetCheckSectors(
     IN  PXENVBD_TARGET  Target,
     IN  PXENVBD_SRBEXT  SrbExt
     )
 {
-    PXENVBD_NOTIFIER    Notifier = FrontendGetNotifier(Target->Frontend);
+    ULONG64             StartSector = Cdb_LogicalBlock(SrbExt->Srb);
+    ULONG               SectorCount = Cdb_TransferBlock(SrbExt->Srb);
 
-    QueueAppend(&Target->ShutdownSrbs, &SrbExt->ListEntry);
-    NotifierKick(Notifier);
-
-    SrbExt->Srb->SrbStatus = SRB_STATUS_PENDING;
-}
-
-VOID
-TargetReset(
-    IN  PXENVBD_TARGET  Target
-    )
-{
-    Verbose("[%u] =====>\n",
-            TargetGetTargetId(Target));
-
-    __TargetPauseDataPath(Target, TRUE);
-
-    if (QueueCount(&Target->SubmittedReqs)) {
-        Error("Target[%d] : backend has %u outstanding requests after a TargetReset\n",
-                TargetGetTargetId(Target), QueueCount(&Target->SubmittedReqs));
-    }
-
-    __TargetUnpauseDataPath(Target);
-
-    Verbose("[%u] <=====\n",
-            TargetGetTargetId(Target));
-}
-
-VOID
-TargetPrepareSrb(
-    IN  PXENVBD_TARGET  Target,
-    IN  PXENVBD_SRBEXT  SrbExt
-    )
-{
-    PSCSI_REQUEST_BLOCK Srb = SrbExt->Srb;
-
-    SrbExt->Srb->SrbStatus = SRB_STATUS_NO_DEVICE;
-    if (TargetIsMissing(Target))
-        return;
-
-    Srb->SrbStatus = SRB_STATUS_PENDING;
+    // prevent read/write beyond the end of the disk
+    if (StartSector >= Target->SectorCount)
+        return FALSE;
+    if (StartSector + SectorCount >= Target->SectorCount)
+        return FALSE;
+    return TRUE;
 }
 
 VOID
@@ -2080,42 +1466,35 @@ TargetStartSrb(
     IN  PXENVBD_SRBEXT  SrbExt
     )
 {
-    const UCHAR         Operation = Cdb_OperationEx(SrbExt->Srb);
-    PXENVBD_DISKINFO    DiskInfo = FrontendGetDiskInfo(Target->Frontend);
+    PSCSI_REQUEST_BLOCK Srb = SrbExt->Srb;
+    UCHAR               Operation;
 
-    if (DiskInfo->DiskInfo & VDISK_READONLY) {
-        Trace("Target[%d] : (%08x) Read-Only, fail SRB (%02x:%s)\n", TargetGetTargetId(Target),
-                DiskInfo->DiskInfo, Operation, Cdb_OperationName(Operation));
-        SrbExt->Srb->ScsiStatus = 0x40; // SCSI_ABORT
-        SrbExt->Srb->SrbStatus = SRB_STATUS_ERROR;
-        return;
-    }
-
+    Operation = Cdb_OperationEx(Srb);
     switch (Operation) {
     case SCSIOP_READ:
-        TargetReadWrite(Target, SrbExt);
-
     case SCSIOP_WRITE:
-        TargetReadWrite(Target, SrbExt);
-        break;
-        
-    case SCSIOP_SYNCHRONIZE_CACHE:
-        TargetSyncCache(Target, SrbExt);
+        if (!TargetCheckSectors(Target, SrbExt))
+            Srb->SrbStatus = SRB_STATUS_ERROR;
+        else
+            TargetQueueSrb(Target, SrbExt);
         break;
 
     case SCSIOP_UNMAP:
-        TargetUnmap(Target, SrbExt);
+        if (Target->FeatureDiscard)
+            TargetQueueSrb(Target, SrbExt);
+        else
+            Srb->SrbStatus = SRB_STATUS_SUCCESS;
+        break;
+
+    case SCSIOP_SYNCHRONIZE_CACHE:
+        if (Target->FeatureBarrier || Target->FeatureFlush)
+            TargetQueueSrb(Target, SrbExt);
+        else
+            Srb->SrbStatus = SRB_STATUS_SUCCESS;
         break;
 
     case SCSIOP_INQUIRY:
-        if (!StorPortSetDeviceQueueDepth(TargetGetAdapter(Target),
-                                         0,
-                                         (UCHAR)TargetGetTargetId(Target),
-                                         0,
-                                         XENVBD_MAX_QUEUE_DEPTH))
-            Verbose("Target[%d] : Failed to set queue depth\n",
-                    TargetGetTargetId(Target));
-        PdoInquiry(TargetGetTargetId(Target), FrontendGetInquiry(Target->Frontend), SrbExt->Srb);
+        TargetInquiry(Target, SrbExt);
         break;
     case SCSIOP_MODE_SENSE:
         TargetModeSense(Target, SrbExt);
@@ -2142,194 +1521,1322 @@ TargetStartSrb(
     case SCSIOP_VERIFY:
     case SCSIOP_VERIFY16:
     case SCSIOP_START_STOP_UNIT:
-        SrbExt->Srb->SrbStatus = SRB_STATUS_SUCCESS;
+        Srb->SrbStatus = SRB_STATUS_SUCCESS;
         break;
 
     default:
-        Trace("Target[%d] : Unsupported CDB (%02x:%s)\n",
-               TargetGetTargetId(Target),
-               Operation,
-               Cdb_OperationName(Operation));
-        SrbExt->Srb->SrbStatus = SRB_STATUS_INVALID_REQUEST;
+        Srb->SrbStatus = SRB_STATUS_INVALID_REQUEST;
         break;
     }
 }
 
-VOID
-TargetFlush(
-    IN  PXENVBD_TARGET  Target,
-    IN  PXENVBD_SRBEXT  SrbExt
+static VOID
+TargetStoreReadDiskInfo(
+    IN  PXENVBD_TARGET  Target
     )
 {
-    __TargetQueueShutdown(Target, SrbExt);
-}
+    PCHAR               Buffer;
+    NTSTATUS            status;
 
-VOID
-TargetShutdown(
-    IN  PXENVBD_TARGET  Target,
-    IN  PXENVBD_SRBEXT  SrbExt
-    )
-{
-    __TargetQueueShutdown(Target, SrbExt);
-}
+    status = XENBUS_STORE(Read,
+                          &Target->StoreInterface,
+                          NULL,
+                          Target->BackendPath,
+                          "info",
+                          &Buffer);
+    if (NT_SUCCESS(status)) {
+        Target->DiskInfo = strtoul(Buffer, NULL, 10);
 
-VOID
-TargetSrbPnp(
-    __in PXENVBD_TARGET             Target,
-    __in PSCSI_PNP_REQUEST_BLOCK Srb
-    )
-{
-    switch (Srb->PnPAction) {
-    case StorQueryCapabilities: {
-        PSTOR_DEVICE_CAPABILITIES DeviceCaps = Srb->DataBuffer;
-        PXENVBD_CAPS    Caps = FrontendGetCaps(Target->Frontend);
+        XENBUS_STORE(Free,
+                     &Target->StoreInterface,
+                     Buffer);
+    }
 
-        if (Caps->Removable)
-            DeviceCaps->Removable = 1;
-        if (Caps->Removable)
-            DeviceCaps->EjectSupported = 1;
-        if (Caps->SurpriseRemovable)
-            DeviceCaps->SurpriseRemovalOK = 1;
+    status = XENBUS_STORE(Read,
+                          &Target->StoreInterface,
+                          NULL,
+                          Target->BackendPath,
+                          "sectors",
+                          &Buffer);
+    if (NT_SUCCESS(status)) {
+        Target->SectorCount = _strtoui64(Buffer, NULL, 10);
 
-        DeviceCaps->UniqueID = 1;
+        XENBUS_STORE(Free,
+                     &Target->StoreInterface,
+                     Buffer);
+    }
 
-        } break;
+    status = XENBUS_STORE(Read,
+                          &Target->StoreInterface,
+                          NULL,
+                          Target->BackendPath,
+                          "sector-size",
+                          &Buffer);
+    if (NT_SUCCESS(status)) {
+        Target->SectorSize = strtoul(Buffer, NULL, 10);
 
-    default:
-        break;
+        XENBUS_STORE(Free,
+                     &Target->StoreInterface,
+                     Buffer);
+    }
+
+    status = XENBUS_STORE(Read,
+                          &Target->StoreInterface,
+                          NULL,
+                          Target->BackendPath,
+                          "physical-sector-size",
+                          &Buffer);
+    if (NT_SUCCESS(status)) {
+        Target->PhysicalSectorSize = strtoul(Buffer, NULL, 10);
+
+        XENBUS_STORE(Free,
+                     &Target->StoreInterface,
+                     Buffer);
+    } else {
+        Target->PhysicalSectorSize = Target->SectorSize;
     }
 }
 
-//=============================================================================
-// PnP Handler
+static VOID
+TargetStoreReadFeatures(
+    IN  PXENVBD_TARGET  Target
+    )
+{
+    PCHAR               Buffer;
+    NTSTATUS            status;
+
+    status = XENBUS_STORE(Read,
+                          &Target->StoreInterface,
+                          NULL,
+                          Target->BackendPath,
+                          "removable",
+                          &Buffer);
+    if (NT_SUCCESS(status)) {
+        Target->Removable = (BOOLEAN)strtoul(Buffer, NULL, 2);
+
+        XENBUS_STORE(Free,
+                     &Target->StoreInterface,
+                     Buffer);
+    }
+
+    status = XENBUS_STORE(Read,
+                          &Target->StoreInterface,
+                          NULL,
+                          Target->BackendPath,
+                          "feature-barrier",
+                          &Buffer);
+    if (NT_SUCCESS(status)) {
+        Target->FeatureBarrier = (BOOLEAN)strtoul(Buffer, NULL, 2);
+
+        XENBUS_STORE(Free,
+                     &Target->StoreInterface,
+                     Buffer);
+    }
+
+    status = XENBUS_STORE(Read,
+                          &Target->StoreInterface,
+                          NULL,
+                          Target->BackendPath,
+                          "feature-flush-cache",
+                          &Buffer);
+    if (NT_SUCCESS(status)) {
+        Target->FeatureFlush = (BOOLEAN)strtoul(Buffer, NULL, 2);
+
+        XENBUS_STORE(Free,
+                     &Target->StoreInterface,
+                     Buffer);
+    }
+
+    status = XENBUS_STORE(Read,
+                          &Target->StoreInterface,
+                          NULL,
+                          Target->BackendPath,
+                          "feature-discard",
+                          &Buffer);
+    if (NT_SUCCESS(status)) {
+        Target->FeatureDiscard = (BOOLEAN)strtoul(Buffer, NULL, 2);
+
+        XENBUS_STORE(Free,
+                     &Target->StoreInterface,
+                     Buffer);
+    }
+
+    status = XENBUS_STORE(Read,
+                          &Target->StoreInterface,
+                          NULL,
+                          Target->BackendPath,
+                          "discard-enable",
+                          &Buffer);
+    if (NT_SUCCESS(status)) {
+        BOOLEAN Enabled = (BOOLEAN)strtoul(Buffer, NULL, 2);
+        if (!Enabled)
+            Target->FeatureDiscard = FALSE;
+
+        XENBUS_STORE(Free,
+                     &Target->StoreInterface,
+                     Buffer);
+    }
+
+    status = XENBUS_STORE(Read,
+                          &Target->StoreInterface,
+                          NULL,
+                          Target->BackendPath,
+                          "discard-secure",
+                          &Buffer);
+    if (NT_SUCCESS(status)) {
+        Target->DiscardSecure = (BOOLEAN)strtoul(Buffer, NULL, 2);
+
+        XENBUS_STORE(Free,
+                     &Target->StoreInterface,
+                     Buffer);
+    }
+
+    status = XENBUS_STORE(Read,
+                          &Target->StoreInterface,
+                          NULL,
+                          Target->BackendPath,
+                          "discard-alignment",
+                          &Buffer);
+    if (NT_SUCCESS(status)) {
+        Target->DiscardAlignment = strtoul(Buffer, NULL, 10);
+
+        XENBUS_STORE(Free,
+                     &Target->StoreInterface,
+                     Buffer);
+    }
+
+    status = XENBUS_STORE(Read,
+                          &Target->StoreInterface,
+                          NULL,
+                          Target->BackendPath,
+                          "discard-secure",
+                          &Buffer);
+    if (NT_SUCCESS(status)) {
+        Target->DiscardGranularity = strtoul(Buffer, NULL, 10);
+
+        XENBUS_STORE(Free,
+                     &Target->StoreInterface,
+                     Buffer);
+    }
+
+    status = XENBUS_STORE(Read,
+                          &Target->StoreInterface,
+                          NULL,
+                          Target->BackendPath,
+                          "feature-max-indirect-segments",
+                          &Buffer);
+    if (NT_SUCCESS(status)) {
+        Target->FeatureIndirect = strtoul(Buffer, NULL, 10);
+
+        XENBUS_STORE(Free,
+                     &Target->StoreInterface,
+                     Buffer);
+    }
+}
+
+static NTSTATUS
+TargetStoreWrite(
+    IN  PXENVBD_TARGET              Target,
+    IN  PXENBUS_STORE_TRANSACTION   Transaction
+    )
+{
+    NTSTATUS                        status;
+
+    status = XENBUS_STORE(Printf,
+                          &Target->StoreInterface,
+                          Transaction,
+                          Target->Path,
+                          "target-id",
+                          "%u",
+                          Target->TargetId);
+    if (!NT_SUCCESS(status))
+        return status;
+
+    status = XENBUS_STORE(Printf,
+                          &Target->StoreInterface,
+                          Transaction,
+                          Target->Path,
+                          "feature-surprise-remove",
+                          "%u",
+                          TRUE);
+    if (!NT_SUCCESS(status))
+        return status;
+
+    status = XENBUS_STORE(Printf,
+                          &Target->StoreInterface,
+                          Transaction,
+                          Target->Path,
+                          "feature-online-resize",
+                          "%u",
+                          TRUE);
+    if (!NT_SUCCESS(status))
+        return status;
+
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+TargetWriteTargetPath(
+    IN  PXENVBD_TARGET  Target
+    )
+{
+    NTSTATUS            status;
+
+    status = XENBUS_STORE(Printf,
+                          &Target->StoreInterface,
+                          NULL,
+                          Target->TargetPath,
+                          "frontend",
+                          "%s",
+                          Target->Path);
+    if (!NT_SUCCESS(status))
+        goto fail1;
+
+    status = XENBUS_STORE(Printf,
+                          &Target->StoreInterface,
+                          NULL,
+                          Target->TargetPath,
+                          "device",
+                          "%u",
+                          Target->DeviceId);
+    if (!NT_SUCCESS(status))
+        goto fail2;
+
+    return STATUS_SUCCESS;
+
+fail2:
+    Error("fail2\n");
+fail1:
+    Error("fail1 %08x\n", status);
+    return status;
+}
+
+static VOID
+TargetWaitForBackendStateChange(
+    IN  PXENVBD_TARGET  Target,
+    OUT XenbusState*    State
+    )
+{
+    KEVENT              Event;
+    PXENBUS_STORE_WATCH Watch;
+    LARGE_INTEGER       Start;
+    ULONGLONG           TimeDelta;
+    LARGE_INTEGER       Timeout;
+    XenbusState         Old = *State;
+    NTSTATUS            status;
+
+    KeInitializeEvent(&Event, NotificationEvent, FALSE);
+
+    status = XENBUS_STORE(WatchAdd,
+                          &Target->StoreInterface,
+                          Target->BackendPath,
+                          "state",
+                          &Event,
+                          &Watch);
+    if (!NT_SUCCESS(status))
+        Watch = NULL;
+
+    KeQuerySystemTime(&Start);
+    TimeDelta = 0;
+
+    Timeout.QuadPart = 0;
+
+    while (*State == Old && TimeDelta < 120000) {
+        PCHAR           Buffer;
+        LARGE_INTEGER   Now;
+
+        if (Watch != NULL) {
+            ULONG   Attempt = 0;
+
+            while (++Attempt < 1000) {
+                status = KeWaitForSingleObject(&Event,
+                                               Executive,
+                                               KernelMode,
+                                               FALSE,
+                                               &Timeout);
+                if (status != STATUS_TIMEOUT)
+                    break;
+
+                // We are waiting for a watch event at DISPATCH_LEVEL so
+                // it is our responsibility to poll the store ring.
+                XENBUS_STORE(Poll,
+                             &Target->StoreInterface);
+
+                KeStallExecutionProcessor(1000);   // 1ms
+            }
+
+            KeClearEvent(&Event);
+        }
+
+        status = XENBUS_STORE(Read,
+                              &Target->StoreInterface,
+                              NULL,
+                              Target->BackendPath,
+                              "state",
+                              &Buffer);
+        if (!NT_SUCCESS(status)) {
+            *State = XenbusStateUnknown;
+        } else {
+            *State = (XenbusState)strtol(Buffer, NULL, 10);
+
+            XENBUS_STORE(Free,
+                         &Target->StoreInterface,
+                         Buffer);
+        }
+
+        KeQuerySystemTime(&Now);
+
+        TimeDelta = (Now.QuadPart - Start.QuadPart) / 10000ull;
+    }
+
+    if (Watch != NULL)
+        (VOID) XENBUS_STORE(WatchRemove,
+                            &Target->StoreInterface,
+                            Watch);
+}
+
+static NTSTATUS
+TargetUpdatePath(
+    IN  PXENVBD_TARGET  Target
+    )
+{
+    ULONG               Length;
+    PCHAR               Buffer;
+    NTSTATUS            status;
+
+    status = XENBUS_STORE(Read,
+                          &Target->StoreInterface,
+                          NULL,
+                          Target->Path,
+                          "backend-id",
+                          &Buffer);
+    if (NT_SUCCESS(status)) {
+        Target->BackendId = (USHORT)strtoul(Buffer, NULL, 10);
+
+        XENBUS_STORE(Free,
+                     &Target->StoreInterface,
+                     Buffer);
+    } else {
+        Target->BackendId = 0;
+    }
+
+    status = XENBUS_STORE(Read,
+                          &Target->StoreInterface,
+                          NULL,
+                          Target->Path,
+                          "backend",
+                          &Buffer);
+    if (!NT_SUCCESS(status))
+        goto fail1;
+
+    __TargetFree(Target->BackendPath);
+    Target->BackendPath = NULL;
+
+    Length = (ULONG)strlen(Buffer);
+
+    status = STATUS_NO_MEMORY;
+    Target->BackendPath = __TargetAllocate(Length + 1);
+    if (Target->BackendPath == NULL)
+        goto fail2;
+
+    RtlCopyMemory(Target->BackendPath, Buffer, Length);
+
+    XENBUS_STORE(Free,
+                 &Target->StoreInterface,
+                 Buffer);
+
+    return STATUS_SUCCESS;
+
+fail2:
+    Error("fail2\n");
+    XENBUS_STORE(Free,
+                 &Target->StoreInterface,
+                 Buffer);
+fail1:
+    Error("fail1 %08x\n", status);
+    return status;
+
+}
+
+static NTSTATUS
+TargetClose(
+    IN  PXENVBD_TARGET  Target
+    )
+{
+    XenbusState         State;
+    NTSTATUS            status;
+
+    Trace("[%u] ----->\n", Target->TargetId);
+
+    if (Target->BackendWatch)
+        XENBUS_STORE(WatchRemove,
+                     &Target->StoreInterface,
+                     Target->BackendWatch);
+    Target->BackendWatch = NULL;
+
+    status = TargetUpdatePath(Target);
+    if (!NT_SUCCESS(status))
+        goto fail1;
+
+    State = XenbusStateUnknown;
+    do {
+        TargetWaitForBackendStateChange(Target, &State);
+
+        status = STATUS_UNSUCCESSFUL;
+        if (State == XenbusStateUnknown)
+            goto fail2;
+    } while (State == XenbusStateInitialising);
+
+    while (State != XenbusStateClosing && 
+           State != XenbusStateClosed) {
+        status = XENBUS_STORE(Printf,
+                                &Target->StoreInterface,
+                                NULL,
+                                Target->Path,
+                                "state",
+                                "%u",
+                                (ULONG)XenbusStateClosing);
+        if (!NT_SUCCESS(status))
+            goto fail3;
+
+        TargetWaitForBackendStateChange(Target, &State);
+
+        status = STATUS_UNSUCCESSFUL;
+        if (State == XenbusStateUnknown)
+            goto fail4;
+    }
+
+    while (State != XenbusStateClosed) {
+        status = XENBUS_STORE(Printf,
+                                &Target->StoreInterface,
+                                NULL,
+                                Target->Path,
+                                "state",
+                                "%u",
+                                (ULONG)XenbusStateClosed);
+        if (!NT_SUCCESS(status))
+            goto fail3;
+
+        TargetWaitForBackendStateChange(Target, &State);
+
+        status = STATUS_UNSUCCESSFUL;
+        if (State == XenbusStateUnknown)
+            goto fail4;
+    }
+
+    Trace("[%u] <-----\n", Target->TargetId);
+    return STATUS_SUCCESS;
+
+fail4:
+    Error("fail4\n");
+fail3:
+    Error("fail3\n");
+fail2:
+    Error("fail2\n");
+fail1:
+    Error("fail1 %08x\n", status);
+    return status;
+}
+
+static NTSTATUS
+TargetPrepare(
+    IN  PXENVBD_TARGET  Target
+    )
+{
+    XenbusState         State;
+    NTSTATUS            status;
+
+    Trace("[%u] ----->\n", Target->TargetId);
+
+    status = TargetUpdatePath(Target);
+    if (!NT_SUCCESS(status))
+        goto fail1;
+
+    status = XENBUS_STORE(WatchAdd,
+                          &Target->StoreInterface,
+                          NULL,
+                          Target->BackendPath,
+                          ThreadGetEvent(Target->BackendThread),
+                          &Target->BackendWatch);
+    if (!NT_SUCCESS(status))
+        goto fail2;
+
+    status = TargetWriteTargetPath(Target);
+    if (!NT_SUCCESS(status))
+        goto fail3;
+
+    status = XENBUS_STORE(Printf,
+                          &Target->StoreInterface,
+                          NULL,
+                          Target->Path,
+                          "state",
+                          "%u",
+                          (ULONG)XenbusStateInitialising);
+    if (!NT_SUCCESS(status))
+        goto fail4;
+
+    State = XenbusStateUnknown;
+    do {
+        TargetWaitForBackendStateChange(Target, &State);
+
+        status = STATUS_UNSUCCESSFUL;
+        if (State == XenbusStateUnknown)
+            goto fail5;
+    } while (State == XenbusStateClosed || 
+             State == XenbusStateInitialising);
+
+    status = STATUS_UNSUCCESSFUL;
+    if (State != XenbusStateInitWait)
+        goto fail6;
+
+    Trace("[%u] <-----\n", Target->TargetId);
+    return STATUS_SUCCESS;
+
+fail6:
+    Error("fail6\n");
+fail5:
+    Error("fail5\n");
+fail4:
+    Error("fail4\n");
+fail3:
+    Error("fail3\n");
+    XENBUS_STORE(WatchRemove,
+                 &Target->StoreInterface,
+                 Target->BackendWatch);
+    Target->BackendWatch = NULL;
+fail2:
+    Error("fail2\n");
+fail1:
+    Error("fail1 %08x\n", status);
+    return status;
+}
+
+static NTSTATUS
+TargetConnect(
+    IN  PXENVBD_TARGET  Target
+    )
+{
+    XenbusState         State;
+    NTSTATUS            status;
+
+    Trace("[%u] ----->\n", Target->TargetId);
+
+    status = GranterConnect(Target->Granter);
+    if (!NT_SUCCESS(status))
+        goto fail1;
+
+    status = BlockRingConnect(Target->BlockRing);
+    if (!NT_SUCCESS(status))
+        goto fail2;
+
+    for (;;) {
+        PXENBUS_STORE_TRANSACTION   Transaction;
+
+        status = XENBUS_STORE(TransactionStart,
+                              &Target->StoreInterface,
+                              &Transaction);
+        if (!NT_SUCCESS(status))
+            break;
+
+        status = BlockRingStoreWrite(Target->BlockRing, Transaction);
+        if (!NT_SUCCESS(status))
+            goto abort;
+
+        status = GranterStoreWrite(Target->Granter, Transaction);
+        if (!NT_SUCCESS(status))
+            goto abort;
+
+        status = TargetStoreWrite(Target, Transaction);
+        if (!NT_SUCCESS(status))
+            goto abort;
+
+        status = XENBUS_STORE(TransactionEnd,
+                              &Target->StoreInterface,
+                              Transaction,
+                              TRUE);
+        if (status == STATUS_RETRY)
+            continue;
+        break;
+
+abort:
+        (VOID) XENBUS_STORE(TransactionEnd,
+                            &Target->StoreInterface,
+                            Transaction,
+                            FALSE);   
+        break;
+    }
+    if (!NT_SUCCESS(status))
+        goto fail3;
+
+    status = XENBUS_STORE(Printf,
+                          &Target->StoreInterface,
+                          NULL,
+                          Target->Path,
+                          "state",
+                          "%u",
+                          (ULONG)XenbusStateInitialised);
+    if (!NT_SUCCESS(status))
+        goto fail4;
+
+    State = XenbusStateUnknown;
+    do {
+       TargetWaitForBackendStateChange(Target, &State);
+
+       status = STATUS_UNSUCCESSFUL;
+       if (State == XenbusStateUnknown)
+           goto fail5;
+    } while (State == XenbusStateInitWait ||
+             State == XenbusStateInitialising ||
+             State == XenbusStateInitialised);
+
+    status = STATUS_UNSUCCESSFUL;
+    if (State != XenbusStateConnected)
+        goto fail6;
+
+    TargetStoreReadDiskInfo(Target);
+    TargetStoreReadFeatures(Target);
+
+    status = XENBUS_STORE(Printf,
+                          &Target->StoreInterface,
+                          NULL,
+                          Target->Path,
+                          "state",
+                          "%u",
+                          (ULONG)XenbusStateConnected);
+    if (!NT_SUCCESS(status))
+        goto fail7;
+
+    Trace("[%u] <-----\n", Target->TargetId);
+    return STATUS_SUCCESS;
+
+fail7:
+    Error("fail7\n");
+fail6:
+    Error("fail6\n");
+fail5:
+    Error("fail5\n");
+fail4:
+    Error("fali4\n");
+fail3:
+    Error("fail3\n");
+    BlockRingDisconnect(Target->BlockRing);
+fail2:
+    Error("fail2\n");
+    GranterDisconnect(Target->Granter);
+fail1:
+    Error("fail1 %08x\n", status);
+    return status;
+}
+
+static VOID
+TargetEnable(
+    IN  PXENVBD_TARGET  Target
+    )
+{
+    Trace("[%u] ----->\n", Target->TargetId);
+
+    GranterEnable(Target->Granter);
+    BlockRingEnable(Target->BlockRing);
+
+    Trace("[%u] <-----\n", Target->TargetId);
+}
+
+static VOID
+TargetDisable(
+    IN  PXENVBD_TARGET  Target
+    )
+{
+    Trace("[%u] ----->\n", Target->TargetId);
+
+    BlockRingDisable(Target->BlockRing);
+    GranterDisable(Target->Granter);
+
+    Trace("[%u] <-----\n", Target->TargetId);
+}
+
+static VOID
+TargetDisconnect(
+    IN  PXENVBD_TARGET  Target
+    )
+{
+    Trace("[%u] ----->\n", Target->TargetId);
+
+    BlockRingDisconnect(Target->BlockRing);
+    GranterDisconnect(Target->Granter);
+
+    Trace("[%u] <-----\n", Target->TargetId);
+}
+
+static FORCEINLINE PCHAR
+XenvbdStateName(
+    IN  XENVBD_STATE    State
+    )
+{
+    switch (State) {
+    case XENVBD_STATE_INVALID:  return "INVALID";
+    case XENVBD_INITIALIZED:    return "INITIAIZED";
+    case XENVBD_CLOSING:        return "CLOSING";
+    case XENVBD_CLOSED:         return "CLOSED";
+    case XENVBD_PREPARED:       return "PREPARED";
+    case XENVBD_CONNECTED:      return "CONNECTED";
+    case XENVBD_ENABLED:        return "ENABLED";
+    default:                    return "<UNKNOWN>";
+    }
+}
+
+static NTSTATUS
+TargetSetState(
+    IN  PXENVBD_TARGET  Target,
+    IN  XENVBD_STATE    State
+    )
+{
+    NTSTATUS            status = STATUS_SUCCESS;
+
+    Verbose("[%u] %s -> %s\n",
+            Target->TargetId,
+            XenvbdStateName(Target->State),
+            XenvbdStateName(State));
+
+    ASSERT(KeGetCurrentIrql() == DISPATCH_LEVEL);
+
+    while (NT_SUCCESS(status) && Target->State != State) {
+        switch (Target->State) {
+        case XENVBD_INITIALIZED:
+            switch (State) {
+            case XENVBD_CLOSING:
+            case XENVBD_CLOSED:
+            case XENVBD_PREPARED:
+            case XENVBD_CONNECTED:
+            case XENVBD_ENABLED:
+                status = TargetClose(Target);
+                if (!NT_SUCCESS(status))
+                    break;
+                Target->State = XENVBD_CLOSED;
+                break;
+            default:
+                status = STATUS_UNSUCCESSFUL;
+                break;
+            }
+            break;
+
+        case XENVBD_CLOSING:
+            switch (State) {
+            case XENVBD_INITIALIZED:
+            case XENVBD_CLOSED:
+            case XENVBD_PREPARED:
+            case XENVBD_CONNECTED:
+            case XENVBD_ENABLED:
+                TargetDisconnect(Target);
+                Target->State = XENVBD_CLOSED;
+                break;
+            default:
+                status = STATUS_UNSUCCESSFUL;
+                break;
+            }
+            break;
+
+        case XENVBD_CLOSED:
+            switch (State) {
+            //case XENVBD_INITIALIZING:
+            //    Target->State = XENVBD_INITIALISED;
+            //    break;
+            case XENVBD_PREPARED:
+            case XENVBD_CONNECTED:
+            case XENVBD_ENABLED:
+                status = TargetPrepare(Target);
+                if (!NT_SUCCESS(status)) {
+                    TargetClose(Target);
+                    Target->State = XENVBD_CLOSED;
+                    break;
+                }
+                Target->State = XENVBD_PREPARED;
+                break;
+            default:
+                status = STATUS_UNSUCCESSFUL;
+                break;
+            }
+            break;
+
+        case XENVBD_PREPARED:
+            switch (State) {
+            case XENVBD_CLOSING:
+            case XENVBD_CLOSED:
+                status = TargetClose(Target);
+                if (!NT_SUCCESS(status))
+                    break;
+                Target->State = XENVBD_CLOSED;
+                break;
+            case XENVBD_CONNECTED:
+            case XENVBD_ENABLED:
+                status = TargetConnect(Target);
+                if (!NT_SUCCESS(status)) {
+                    TargetClose(Target);
+                    Target->State = XENVBD_CLOSED;
+                    break;
+                }
+                Target->State = XENVBD_CONNECTED;
+                break;
+            default:
+                status = STATUS_UNSUCCESSFUL;
+                break;
+            }
+            break;
+
+        case XENVBD_CONNECTED:
+            switch (State) {
+            case XENVBD_ENABLED:
+                TargetEnable(Target);
+                Target->State = XENVBD_ENABLED;
+                break;
+            case XENVBD_CLOSING:
+            case XENVBD_CLOSED:
+                status = TargetClose(Target);
+                if (!NT_SUCCESS(status))
+                    break;
+                Target->State = XENVBD_CLOSING;
+                break;
+            default:
+                status = STATUS_UNSUCCESSFUL;
+                break;
+            }
+            break;
+
+        case XENVBD_ENABLED:
+            switch (State) {
+            case XENVBD_CLOSING:
+            case XENVBD_CLOSED:
+            case XENVBD_CONNECTED:
+                TargetDisable(Target);
+                Target->State = XENVBD_CONNECTED;
+                break;
+            default:
+                status = STATUS_UNSUCCESSFUL;
+                break;
+            }
+            break;
+
+        default:
+            status = STATUS_UNSUCCESSFUL;
+            break;
+        }
+    }
+
+    Verbose("[%u] in state %s\n",
+            Target->TargetId,
+            XenvbdStateName(Target->State));
+
+    return status;
+}
+
+static FORCEINLINE NTSTATUS
+__TargetD3ToD0(
+    IN  PXENVBD_TARGET  Target
+    )
+{
+    NTSTATUS            status;
+
+    status = XENBUS_STORE(Acquire, &Target->StoreInterface);
+    if (!NT_SUCCESS(status))
+        goto fail1;
+
+    status = TargetSetState(Target, XENVBD_ENABLED);
+    if (!NT_SUCCESS(status))
+        goto fail2;
+
+    return STATUS_SUCCESS;
+
+fail2:
+    Error("fail2\n");
+    XENBUS_STORE(Release, &Target->StoreInterface);
+fail1:
+    Error("fail1 %08x\n", status);
+    return status;
+}
+
+static FORCEINLINE VOID
+__TargetD0ToD3(
+    IN  PXENVBD_TARGET  Target
+    )
+{
+    TargetSetState(Target, XENVBD_CLOSED);
+
+    XENBUS_STORE(Release, &Target->StoreInterface);
+}
+
+static DECLSPEC_NOINLINE VOID
+TargetSuspendCallback(
+    IN  PVOID       Context
+    )
+{
+    PXENVBD_TARGET  Target = Context;
+    LIST_ENTRY      List;
+    NTSTATUS        status;
+
+    // Any outstanding requests are going to cause problems...
+    // Submitted requests are lost
+    // Prepared requests will need re-preparing (different grant/backend)
+    // Fresh SRBs will be ok
+    InitializeListHead(&List);
+    for (;;) {
+        PLIST_ENTRY     ListEntry;
+        PXENVBD_REQUEST Request;
+        PXENVBD_SRBEXT  SrbExt;
+
+        ListEntry = RemoveHeadList(&Target->Submitted);
+        if (ListEntry == &Target->Submitted)
+            break;
+        Request = CONTAINING_RECORD(ListEntry, XENVBD_REQUEST, ListEntry);
+        SrbExt = Request->SrbExt;
+
+        TargetPutRequest(Target, Request);
+        if (InterlockedDecrement(&SrbExt->RequestCount) == 0) {
+            SrbExt->Srb->SrbStatus = SRB_STATUS_ABORTED;
+            AdapterCompleteSrb(Target->Adapter, SrbExt);
+        }
+    }
+    for (;;) {
+        PLIST_ENTRY     ListEntry;
+        PXENVBD_REQUEST Request;
+        PXENVBD_SRBEXT  SrbExt;
+
+        ListEntry = RemoveHeadList(&Target->Prepared);
+        if (ListEntry == &Target->Prepared)
+            break;
+        Request = CONTAINING_RECORD(ListEntry, XENVBD_REQUEST, ListEntry);
+        SrbExt = Request->SrbExt;
+
+        TargetPutRequest(Target, Request);
+        if (InterlockedDecrement(&SrbExt->RequestCount) == 0) {
+            InsertHeadList(&List, &SrbExt->ListEntry);
+        }
+    }
+    for (;;) {
+        PLIST_ENTRY     ListEntry;
+
+        ListEntry = RemoveHeadList(&List);
+        if (ListEntry == &List)
+            break;
+
+        InsertHeadList(&Target->Fresh, ListEntry);
+    }
+
+    __TargetD0ToD3(Target);
+
+    status = __TargetD3ToD0(Target);
+    ASSERT(NT_SUCCESS(status));
+}
+
+static DECLSPEC_NOINLINE VOID
+TargetDebugCallback(
+    IN  PVOID       Context,
+    IN  BOOLEAN     Crashing
+    )
+{
+    PXENVBD_TARGET  Target = Context;
+
+    UNREFERENCED_PARAMETER(Crashing);
+
+    XENBUS_DEBUG(Printf,
+                 &Target->DebugInterface,
+                 "Adapter: 0x%p DeviceObject: 0x%p\n",
+                 Target->Adapter,
+                 Target->DeviceObject);
+
+    XENBUS_DEBUG(Printf,
+                 &Target->DebugInterface,
+                 "TargetI: %u DeviceId: %u BackendId: %u\n",
+                 Target->TargetId,
+                 Target->DeviceId,
+                 Target->BackendId);
+
+    XENBUS_DEBUG(Printf,
+                 &Target->DebugInterface,
+                 "Path: %s\n",
+                 Target->Path);
+
+    XENBUS_DEBUG(Printf,
+                 &Target->DebugInterface,
+                 "BackendPath: %s\n",
+                 Target->BackendPath ? Target->BackendPath : "NULL");
+
+    XENBUS_DEBUG(Printf,
+                 &Target->DebugInterface,
+                 "TargetPath: %s\n",
+                 Target->TargetPath);
+
+    XENBUS_DEBUG(Printf,
+                &Target->DebugInterface,
+                "Features: %s%s%s%s%s\n",
+                Target->Removable ? "REMOVABLE " : "",
+                Target->FeatureBarrier ? "BARRIER " : "",
+                Target->FeatureDiscard ? "DISCARD " : "",
+                Target->FeatureFlush ? "FLUSH " : "",
+                Target->FeatureIndirect ? "INDIRECT " : "");
+
+    if (Target->FeatureDiscard) {
+        XENBUS_DEBUG(Printf,
+                    &Target->DebugInterface,
+                    "DISCARD: %s%u @ %u\n",
+                    Target->DiscardSecure ? "SECURE " : "",
+                    Target->DiscardAlignment,
+                    Target->DiscardGranularity);
+    }
+
+    if (Target->FeatureIndirect) {
+        XENBUS_DEBUG(Printf,
+                    &Target->DebugInterface,
+                    "INDIRECT: %u MaxSegsPerInd\n",
+                    Target->FeatureIndirect);
+    }
+
+    XENBUS_DEBUG(Printf,
+                &Target->DebugInterface,
+                "%llu sectors @ %u (%u) %08x\n",
+                Target->SectorCount,
+                Target->SectorSize,
+                Target->PhysicalSectorSize,
+                Target->DiskInfo);
+}
+
+static DECLSPEC_NOINLINE NTSTATUS
+TargetBackendThread(
+    IN  PXENVBD_THREAD  Self,
+    IN  PVOID           Context
+    )
+{
+    PXENVBD_TARGET      Target = Context;
+    PKEVENT             Event = ThreadGetEvent(Self); 
+    LARGE_INTEGER       Start;
+    LARGE_INTEGER       Now;
+
+    KeQuerySystemTime(&Start);
+    for (;;) {
+        PCHAR           Buffer;
+        NTSTATUS        status;
+        KIRQL           Irql;
+        BOOLEAN         Online = TRUE;
+
+        (VOID) KeWaitForSingleObject(Event,
+                                     Executive,
+                                     KernelMode,
+                                     FALSE,
+                                     NULL);
+        if (ThreadIsAlerted(Self))
+            break;
+
+        KeQuerySystemTime(&Now);
+        // Rate limit checking to once a second
+        if ((Now.QuadPart - Start.QuadPart) < 10000000ull)
+            continue;
+        Start.QuadPart = Now.QuadPart;
+
+        KeAcquireSpinLock(&Target->StateLock, &Irql);
+        if (Target->DevicePowerState != PowerDeviceD0) {
+            KeReleaseSpinLock(&Target->StateLock, Irql);
+            continue;
+        }
+        KeReleaseSpinLock(&Target->StateLock, Irql);
+
+        TargetStoreReadDiskInfo(Target);
+
+        status = XENBUS_STORE(Read,
+                              &Target->StoreInterface,
+                              NULL,
+                              Target->BackendPath,
+                              "online",
+                              &Buffer);
+        if (NT_SUCCESS(status)) {
+            Online = (BOOLEAN)strtoul(Buffer, NULL, 2);
+
+            XENBUS_STORE(Free,
+                            &Target->StoreInterface,
+                            Buffer);
+        }
+
+        if (!Online) {
+            // eject!
+            TargetSetMissing(Target, "Ejecting");
+            AdapterTargetListChanged(TargetGetAdapter(Target));
+        }
+    }
+
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS
+TargetD3ToD0(
+    IN  PXENVBD_TARGET  Target
+    )
+{
+    KIRQL               Irql;
+    NTSTATUS            status;
+
+    if (Target->DevicePowerState == PowerDeviceD0)
+        return STATUS_SUCCESS;
+
+    Verbose("[%u] =====>\n",
+            Target->TargetId);
+
+    status = XENBUS_DEBUG(Acquire, &Target->DebugInterface);
+    if (!NT_SUCCESS(status))
+        goto fail1;
+
+    status = XENBUS_SUSPEND(Acquire, &Target->SuspendInterface);
+    if (!NT_SUCCESS(status))
+        goto fail2;
+
+    status = XENBUS_DEBUG(Register,
+                          &Target->DebugInterface,
+                         __MODULE__,
+                         TargetDebugCallback,
+                         Target,
+                         &Target->DebugCallback);
+    if (!NT_SUCCESS(status))
+        goto fail3;
+
+    status = XENBUS_SUSPEND(Register,
+                            &Target->SuspendInterface,
+                            SUSPEND_CALLBACK_LATE,
+                            TargetSuspendCallback,
+                            Target,
+                            &Target->SuspendCallback);
+    if (!NT_SUCCESS(status))
+        goto fail4;
+
+    KeAcquireSpinLock(&Target->StateLock, &Irql);
+    status = __TargetD3ToD0(Target);
+    KeReleaseSpinLock(&Target->StateLock, Irql);
+    if (!NT_SUCCESS(status))
+        goto fail5;
+
+    Target->DevicePowerState = PowerDeviceD0;
+    Verbose("[%u] <=====\n",
+            Target->TargetId);
+    return STATUS_SUCCESS;
+
+fail5:
+    Error("fail5\n");
+    XENBUS_SUSPEND(Deregister,
+                    &Target->SuspendInterface,
+                    Target->SuspendCallback);
+    Target->SuspendCallback = NULL;
+fail4:
+    Error("fail4\n");
+    XENBUS_DEBUG(Deregister,
+                 &Target->DebugInterface,
+                 Target->DebugCallback);
+    Target->DebugCallback = NULL;
+fail3:
+    Error("fail3\n");
+    XENBUS_SUSPEND(Release,
+                   &Target->SuspendInterface);
+fail2:
+    Error("fail2\n");
+    XENBUS_DEBUG(Release,
+                 &Target->DebugInterface);
+fail1:
+    Error("fail1 %08x\n", status);
+    return status;
+}
+
+VOID
+TargetD0ToD3(
+    IN  PXENVBD_TARGET  Target
+    )
+{
+    KIRQL               Irql;
+
+    if (Target->DevicePowerState == PowerDeviceD3)
+        return;
+
+    Verbose("[%u] =====>\n",
+            Target->TargetId);
+    Target->DevicePowerState = PowerDeviceD3;
+
+    KeAcquireSpinLock(&Target->StateLock, &Irql);
+    __TargetD0ToD3(Target);
+    KeReleaseSpinLock(&Target->StateLock, Irql);
+
+    XENBUS_SUSPEND(Deregister,
+                    &Target->SuspendInterface,
+                    Target->SuspendCallback);
+    Target->SuspendCallback = NULL;
+
+    XENBUS_DEBUG(Deregister,
+                 &Target->DebugInterface,
+                 Target->DebugCallback);
+    Target->DebugCallback = NULL;
+
+    XENBUS_SUSPEND(Release,
+                   &Target->SuspendInterface);
+
+    XENBUS_DEBUG(Release,
+                 &Target->DebugInterface);
+
+    Verbose("[%u] <=====\n",
+            Target->TargetId);
+}
+
+static FORCEINLINE PCHAR
+__DeviceUsageName(
+    IN  ULONG   Index
+    )
+{
+    switch (Index) {
+    case DeviceUsageTypeUndefined:      return NULL;
+    case DeviceUsageTypePaging:         return "paging";
+    case DeviceUsageTypeHibernation:    return "hibernation";
+    case DeviceUsageTypeDumpFile:       return "dump";
+    default:                            return NULL;
+    }
+}
+
 static FORCEINLINE VOID
 __TargetDeviceUsageNotification(
-    __in PXENVBD_TARGET             Target,
-    __in PIRP                    Irp
+    IN  PXENVBD_TARGET      Target,
+    IN  PIRP                Irp
     )
 {
     PIO_STACK_LOCATION      StackLocation;
+    ULONG                   Index;
     BOOLEAN                 Value;
-    DEVICE_USAGE_NOTIFICATION_TYPE  Type;
-    PXENVBD_CAPS            Caps = FrontendGetCaps(Target->Frontend);
 
     StackLocation = IoGetCurrentIrpStackLocation(Irp);
     Value = StackLocation->Parameters.UsageNotification.InPath;
-    Type  = StackLocation->Parameters.UsageNotification.Type;
+    Index = (ULONG)StackLocation->Parameters.UsageNotification.Type;
 
-    switch (Type) {
-    case DeviceUsageTypePaging:
-        if (Caps->Paging == Value)
-            return;
-        Caps->Paging = Value;
-        break;
-
-    case DeviceUsageTypeHibernation:
-        if (Caps->Hibernation == Value)
-            return;
-        Caps->Hibernation = Value;
-        break;
-
-    case DeviceUsageTypeDumpFile:
-        if (Caps->DumpFile == Value)
-            return;
-        Caps->DumpFile = Value;
-        break;
-
-    default:
+    if (__DeviceUsageName(Index) == NULL)
         return;
-    }
-    FrontendWriteUsage(Target->Frontend);
+    if (Target->DeviceUsage[Index] == Value)
+        return;
+
+    Target->DeviceUsage[Index] = Value;
+
+    Verbose("[%u] %s %s\n",
+            Target->TargetId,
+            Value ? "ADDING" : "REMOVING",
+            __DeviceUsageName(Index));
+
+    (VOID) XENBUS_STORE(Printf,
+                        &Target->StoreInterface,
+                        NULL,
+                        Target->TargetPath,
+                        __DeviceUsageName(Index),
+                        "%u",
+                        Value);
 }
 
-static FORCEINLINE VOID
-__TargetCheckEjectPending(
-    __in PXENVBD_TARGET             Target
-    )
-{
-    KIRQL               Irql;
-    BOOLEAN             EjectPending = FALSE;
-
-    KeAcquireSpinLock(&Target->Lock, &Irql);
-    if (Target->EjectPending) {
-        EjectPending = TRUE;
-        Target->EjectPending = FALSE;
-        Target->EjectRequested = TRUE;
-    }
-    KeReleaseSpinLock(&Target->Lock, Irql);
-
-    if (EjectPending) {
-        Verbose("Target[%d] : IoRequestDeviceEject(0x%p)\n", TargetGetTargetId(Target), Target->DeviceObject);
-        IoRequestDeviceEject(Target->DeviceObject);
-    }
-}
-
-static FORCEINLINE VOID
-__TargetCheckEjectFailed(
-    __in PXENVBD_TARGET             Target
-    )
-{
-    KIRQL               Irql;
-    BOOLEAN             EjectFailed = FALSE;
-
-    KeAcquireSpinLock(&Target->Lock, &Irql);
-    if (Target->EjectRequested) {
-        EjectFailed = TRUE;
-        Target->EjectRequested = FALSE;
-    }
-    KeReleaseSpinLock(&Target->Lock, Irql);
-
-    if (EjectFailed) {
-        Error("Target[%d] : Unplug failed due to open handle(s)!\n", TargetGetTargetId(Target));
-        FrontendStoreWriteFrontend(Target->Frontend, "error", "Unplug failed due to open handle(s)!");
-    }
-}
-
-static FORCEINLINE VOID
-__TargetRemoveDevice(
-    __in PXENVBD_TARGET             Target
-    )
-{
-    TargetD0ToD3(Target);
-
-    switch (TargetGetDevicePnpState(Target)) {
-    case SurpriseRemovePending:
-        TargetSetMissing(Target, "Surprise Remove");
-        TargetSetDevicePnpState(Target, Deleted);
-        AdapterTargetListChanged(TargetGetAdapter(Target));
-        break;
-
-    default:
-        TargetSetMissing(Target, "Removed");
-        TargetSetDevicePnpState(Target, Deleted);
-        AdapterTargetListChanged(TargetGetAdapter(Target));
-        break;
-    }
-}
-
-static FORCEINLINE VOID
-__TargetEject(
-    __in PXENVBD_TARGET             Target
-    )
-{
-    TargetSetMissing(Target, "Ejected");
-    TargetSetDevicePnpState(Target, Deleted);
-    AdapterTargetListChanged(TargetGetAdapter(Target));
-}
-
-__checkReturn
 NTSTATUS
 TargetDispatchPnp(
-    __in PXENVBD_TARGET             Target,
-    __in PDEVICE_OBJECT          DeviceObject,
-    __in PIRP                    Irp
+    IN  PXENVBD_TARGET  Target,
+    IN  PDEVICE_OBJECT  DeviceObject,
+    IN  PIRP            Irp
     )
 {
-    PIO_STACK_LOCATION  Stack = IoGetCurrentIrpStackLocation(Irp);
-
-    __TargetCheckEjectPending(Target);
-
-    switch (Stack->MinorFunction) {
+    PIO_STACK_LOCATION  StackLocation;
+    
+    StackLocation = IoGetCurrentIrpStackLocation(Irp);
+    switch (StackLocation->MinorFunction) {
     case IRP_MN_START_DEVICE:
         (VOID) TargetD3ToD0(Target);
         TargetSetDevicePnpState(Target, Started);
@@ -2340,7 +2847,7 @@ TargetDispatchPnp(
         break;
 
     case IRP_MN_CANCEL_STOP_DEVICE:
-        __TargetRestoreDevicePnpState(Target, StopPending);
+        TargetRestoreDevicePnpState(Target);
         break;
 
     case IRP_MN_STOP_DEVICE:
@@ -2353,8 +2860,8 @@ TargetDispatchPnp(
         break;
 
     case IRP_MN_CANCEL_REMOVE_DEVICE:
-        __TargetCheckEjectFailed(Target);
-        __TargetRestoreDevicePnpState(Target, RemovePending);
+        // Should write something to Xenstore to indicate the VETO on deviceeject
+        TargetRestoreDevicePnpState(Target);
         break;
 
     case IRP_MN_SURPRISE_REMOVAL:
@@ -2362,11 +2869,16 @@ TargetDispatchPnp(
         break;
 
     case IRP_MN_REMOVE_DEVICE:
-        __TargetRemoveDevice(Target);
+        TargetD0ToD3(Target);
+        TargetSetMissing(Target, DevicePnpStateName(Target->DevicePnpState));
+        TargetSetDevicePnpState(Target, Deleted);
+        AdapterTargetListChanged(TargetGetAdapter(Target));
         break;
 
     case IRP_MN_EJECT:
-        __TargetEject(Target);
+        TargetSetMissing(Target, "Ejected");
+        TargetSetDevicePnpState(Target, Deleted);
+        AdapterTargetListChanged(TargetGetAdapter(Target));
         break;
 
     case IRP_MN_DEVICE_USAGE_NOTIFICATION:
@@ -2376,114 +2888,15 @@ TargetDispatchPnp(
     default:
         break;
     }
+
     return DriverDispatchPnp(DeviceObject, Irp);
-}
-
-__drv_maxIRQL(DISPATCH_LEVEL)
-VOID
-TargetIssueDeviceEject(
-    __in PXENVBD_TARGET             Target,
-    __in __nullterminated const CHAR* Reason
-    )
-{
-    KIRQL       Irql;
-    BOOLEAN     DoEject = FALSE;
-
-    KeAcquireSpinLock(&Target->Lock, &Irql);
-    if (Target->DeviceObject) {
-        DoEject = TRUE;
-        Target->EjectRequested = TRUE;
-    } else {
-        Target->EjectPending = TRUE;
-    }
-    KeReleaseSpinLock(&Target->Lock, Irql);
-
-    Verbose("Target[%d] : Ejecting (%s - %s)\n", TargetGetTargetId(Target), DoEject ? "Now" : "Next PnP IRP", Reason);
-    if (!Target->WrittenEjected) {
-        Target->WrittenEjected = TRUE;
-        FrontendStoreWriteFrontend(Target->Frontend, "ejected", "1");
-    }
-    if (DoEject) {
-        Verbose("Target[%d] : IoRequestDeviceEject(0x%p)\n", TargetGetTargetId(Target), Target->DeviceObject);
-        IoRequestDeviceEject(Target->DeviceObject);
-    } else {
-        Verbose("Target[%d] : Triggering BusChangeDetected to detect device\n", TargetGetTargetId(Target));
-        AdapterTargetListChanged(TargetGetAdapter(Target));
-    }
-}
-
-__checkReturn
-NTSTATUS
-TargetD3ToD0(
-    __in PXENVBD_TARGET            Target
-    )
-{
-    NTSTATUS                    Status;
-    const ULONG                 TargetId = TargetGetTargetId(Target);
-
-    if (!TargetSetDevicePowerState(Target, PowerDeviceD0))
-        return STATUS_SUCCESS;
-
-    Trace("Target[%d] @ (%d) =====>\n", TargetId, KeGetCurrentIrql());
-    Verbose("Target[%d] : D3->D0\n", TargetId);
-
-    // power up frontend
-    Status = FrontendD3ToD0(Target->Frontend);
-    if (!NT_SUCCESS(Status))
-        goto fail1;
-
-    // connect frontend
-    Status = FrontendSetState(Target->Frontend, XENVBD_ENABLED);
-    if (!NT_SUCCESS(Status))
-        goto fail2;
-    __TargetUnpauseDataPath(Target);
-
-    Trace("Target[%d] @ (%d) <=====\n", TargetId, KeGetCurrentIrql());
-    return STATUS_SUCCESS;
-
-fail2:
-    Error("Fail2\n");
-    FrontendD0ToD3(Target->Frontend);
-
-fail1:
-    Error("Fail1 (%08x)\n", Status);
-
-    Target->DevicePowerState = PowerDeviceD3;
-
-    return Status;
-}
-
-VOID
-TargetD0ToD3(
-    __in PXENVBD_TARGET            Target
-    )
-{
-    const ULONG                 TargetId = TargetGetTargetId(Target);
-
-    if (!TargetSetDevicePowerState(Target, PowerDeviceD3))
-        return;
-
-    Trace("Target[%d] @ (%d) =====>\n", TargetId, KeGetCurrentIrql());
-    Verbose("Target[%d] : D0->D3\n", TargetId);
-
-    // close frontend
-    __TargetPauseDataPath(Target, FALSE);
-    (VOID) FrontendSetState(Target->Frontend, XENVBD_CLOSED);
-    ASSERT3U(QueueCount(&Target->SubmittedReqs), ==, 0);
-
-    // power down frontend
-    FrontendD0ToD3(Target->Frontend);
-
-    Trace("Target[%d] @ (%d) <=====\n", TargetId, KeGetCurrentIrql());
 }
 
 static FORCEINLINE ULONG
 __ParseVbd(
-    IN  PCHAR   DeviceIdStr
+    IN  ULONG   DeviceId
     )
-{
-    ULONG   DeviceId = strtoul(DeviceIdStr, NULL, 10);
-    
+{    
     ASSERT3U((DeviceId & ~((1 << 29) - 1)), ==, 0);
 
     if (DeviceId & (1 << 28))
@@ -2504,140 +2917,235 @@ __ParseVbd(
     }
 }
 
-__checkReturn
 NTSTATUS
 TargetCreate(
-    __in PXENVBD_ADAPTER             Adapter,
-    __in __nullterminated PCHAR  DeviceId,
-    OUT PXENVBD_TARGET*         _Target
+    IN  PXENVBD_ADAPTER Adapter,
+    IN  PANSI_STRING    Device,
+    OUT PXENVBD_TARGET* _Target
     )
 {
-    NTSTATUS    Status;
-    PXENVBD_TARGET Target;
-    ULONG           TargetId;
+    PXENVBD_TARGET      Target;
+    ULONG               DeviceId;
+    ULONG               TargetId;
+    ULONG               Size;
+    NTSTATUS            status;
 
+    DeviceId = strtoul(Device->Buffer, NULL, 10);
     TargetId = __ParseVbd(DeviceId);
     if (TargetId >= XENVBD_MAX_TARGETS)
         return STATUS_RETRY;
-
     if (AdapterIsTargetEmulated(Adapter, TargetId))
         return STATUS_RETRY;
 
-    Trace("Target[%d] @ (%d) =====>\n", TargetId, KeGetCurrentIrql());
+    Verbose("[%u] =====> %s\n", TargetId, Device->Buffer);
 
-    Status = STATUS_INSUFFICIENT_RESOURCES;
-#pragma warning(suppress: 6014)
-    Target = __TargetAlloc(sizeof(XENVBD_TARGET));
-    if (!Target)
+    status = STATUS_NO_MEMORY; 
+    Target = __TargetAllocate(sizeof(XENVBD_TARGET));
+    if (Target == NULL)
         goto fail1;
 
-    Verbose("Target[%d] : Creating\n", TargetId);
-    Target->Signature      = TARGET_SIGNATURE;
-    Target->Adapter            = Adapter;
-    Target->DeviceObject   = NULL; // filled in later
-    Target->Paused         = 1; // Paused until D3->D0 transition
-    Target->DevicePnpState = Present;
+    Target->Adapter         = Adapter;
+    Target->DeviceObject    = NULL; // filled in later
+    Target->DevicePnpState  = Present;
     Target->DevicePowerState = PowerDeviceD3;
+    Target->DeviceId        = DeviceId;
+    Target->TargetId        = TargetId;
+    Target->State           = XENVBD_INITIALIZED;
+    Target->BackendId       = DOMID_INVALID;
+    KeInitializeSpinLock(&Target->StateLock);
+    KeInitializeSpinLock(&Target->QueueLock);
 
-    KeInitializeSpinLock(&Target->Lock);
-    QueueInit(&Target->FreshSrbs);
-    QueueInit(&Target->PreparedReqs);
-    QueueInit(&Target->SubmittedReqs);
-    QueueInit(&Target->ShutdownSrbs);
-    __LookasideInit(&Target->RequestList, sizeof(XENVBD_REQUEST), REQUEST_POOL_TAG);
-    __LookasideInit(&Target->SegmentList, sizeof(XENVBD_SEGMENT), SEGMENT_POOL_TAG);
-    __LookasideInit(&Target->IndirectList, sizeof(XENVBD_INDIRECT), INDIRECT_POOL_TAG);
+    AdapterGetDebugInterface(Adapter, &Target->DebugInterface);
+    AdapterGetStoreInterface(Adapter, &Target->StoreInterface);
+    AdapterGetSuspendInterface(Adapter, &Target->SuspendInterface);
 
-    Status = FrontendCreate(Target, DeviceId, TargetId, &Target->Frontend);
-    if (!NT_SUCCESS(Status))
+    status = STATUS_NO_MEMORY;
+    Size = sizeof("device/vbd/") + Device->Length + 1;
+    Target->Path = __TargetAllocate(Size);
+    if (Target->Path == NULL)
         goto fail2;
 
-    Status = TargetD3ToD0(Target);
-    if (!NT_SUCCESS(Status))
+    status = RtlStringCbPrintfA(Target->Path,
+                                Size,
+                                "device/vbd/%s",
+                                Device->Buffer);
+    if (!NT_SUCCESS(status))
         goto fail3;
 
-    *_Target = Target;
+    status = STATUS_NO_MEMORY;
+    Size = sizeof("data/scsi/target/XXXX") + 1;
+    Target->TargetPath = __TargetAllocate(Size);
+    if (Target->TargetPath == NULL)
+        goto fail4;
 
-    Verbose("Target[%d] : Created (%s)\n", TargetId, Target);
-    Trace("Target[%d] @ (%d) <=====\n", TargetId, KeGetCurrentIrql());
+    status = RtlStringCbPrintfA(Target->TargetPath,
+                                Size,
+                                "data/scsi/target/%u",
+                                TargetId);
+    if (!NT_SUCCESS(status))
+        goto fail5;
+
+    status = GranterCreate(Target, &Target->Granter);
+    if (!NT_SUCCESS(status))
+        goto fail6;
+
+    status = BlockRingCreate(Target, &Target->BlockRing);
+    if (!NT_SUCCESS(status))
+        goto fail7;
+
+    status = ThreadCreate(TargetBackendThread,
+                          Target,
+                          &Target->BackendThread);
+    if (!NT_SUCCESS(status))
+        goto fail8;
+
+    InitializeListHead(&Target->Fresh);
+    InitializeListHead(&Target->Prepared);
+    InitializeListHead(&Target->Submitted);
+    InitializeListHead(&Target->Shutdown);
+
+    ExInitializeNPagedLookasideList(&Target->RequestList,
+                                    NULL,
+                                    NULL,
+                                    0,
+                                    sizeof(XENVBD_REQUEST),
+                                    REQUEST_POOL_TAG,
+                                    0);
+    ExInitializeNPagedLookasideList(&Target->SegmentList,
+                                    NULL,
+                                    NULL,
+                                    0,
+                                    sizeof(XENVBD_SEGMENT),
+                                    SEGMENT_POOL_TAG,
+                                    0);
+    ExInitializeNPagedLookasideList(&Target->IndirectList,
+                                    NULL,
+                                    NULL,
+                                    0,
+                                    sizeof(XENVBD_INDIRECT),
+                                    INDIRECT_POOL_TAG,
+                                    0);
+
+    status = TargetD3ToD0(Target);
+    if (!NT_SUCCESS(status))
+        goto fail9;
+
+    Verbose("[%u] <=====\n", TargetId);
+    *_Target = Target;
     return STATUS_SUCCESS;
 
+fail9:
+    Error("fail9\n");
+
+    ExDeleteNPagedLookasideList(&Target->RequestList);
+    ExDeleteNPagedLookasideList(&Target->SegmentList);
+    ExDeleteNPagedLookasideList(&Target->IndirectList);
+
+    RtlZeroMemory(&Target->Fresh, sizeof(LIST_ENTRY));
+    RtlZeroMemory(&Target->Prepared, sizeof(LIST_ENTRY));
+    RtlZeroMemory(&Target->Submitted, sizeof(LIST_ENTRY));
+    RtlZeroMemory(&Target->Shutdown, sizeof(LIST_ENTRY));
+
+    ThreadAlert(Target->BackendThread);
+    ThreadJoin(Target->BackendThread);
+    Target->BackendThread = NULL;
+fail8:
+    Error("fail8\n");
+    BlockRingDestroy(Target->BlockRing);
+    Target->BlockRing = NULL;
+fail7:
+    Error("fail7\n");
+    GranterDestroy(Target->Granter);
+    Target->Granter = NULL;
+fail6:
+    Error("fail6\n");
+fail5:
+    Error("fail5\n");
+    __TargetFree(Target->TargetPath);
+    Target->TargetPath = NULL;
+fail4:
+    Error("fail4\n");
 fail3:
-    Error("Fail3\n");
-    FrontendDestroy(Target->Frontend);
-    Target->Frontend = NULL;
-
+    Error("fail3\n");
+    __TargetFree(Target->Path);
+    Target->Path = NULL;
 fail2:
-    Error("Fail2\n");
-    __LookasideTerm(&Target->IndirectList);
-    __LookasideTerm(&Target->SegmentList);
-    __LookasideTerm(&Target->RequestList);
-    __TargetFree(Target);
+    Error("fail2\n");
+    RtlZeroMemory(&Target->DebugInterface, sizeof(XENBUS_DEBUG_INTERFACE));
+    RtlZeroMemory(&Target->StoreInterface, sizeof(XENBUS_STORE_INTERFACE));
+    RtlZeroMemory(&Target->SuspendInterface, sizeof(XENBUS_SUSPEND_INTERFACE));
 
+    Target->Adapter         = NULL;
+    Target->DeviceObject    = NULL; // filled in later
+    Target->DevicePnpState  = 0;
+    Target->DevicePowerState = 0;
+    Target->DeviceId        = 0;
+    Target->TargetId        = 0;
+    Target->State           = 0;
+    Target->BackendId       = 0;
+    RtlZeroMemory(&Target->QueueLock, sizeof(KSPIN_LOCK));
+    RtlZeroMemory(&Target->StateLock, sizeof(KSPIN_LOCK));
+
+    ASSERT(IsZeroMemory(Target, sizeof(XENVBD_TARGET)));
+    __TargetFree(Target);
 fail1:
-    Error("Fail1 (%08x)\n", Status);
-    return Status;
+    Error("fail1 %08x\n", status);
+    return status;
 }
 
 VOID
 TargetDestroy(
-    __in PXENVBD_TARGET    Target
+    IN  PXENVBD_TARGET  Target
     )
 {
-    const ULONG         TargetId = TargetGetTargetId(Target);
-    PVOID               Objects[3];
-    PKWAIT_BLOCK        WaitBlock;
+    ASSERT(IsListEmpty(&Target->Fresh));
+    ASSERT(IsListEmpty(&Target->Prepared));
+    ASSERT(IsListEmpty(&Target->Submitted));
+    ASSERT(IsListEmpty(&Target->Shutdown));
 
-    Trace("Target[%d] @ (%d) =====>\n", TargetId, KeGetCurrentIrql());
-    Verbose("Target[%d] : Destroying\n", TargetId);
+    ExDeleteNPagedLookasideList(&Target->RequestList);
+    ExDeleteNPagedLookasideList(&Target->SegmentList);
+    ExDeleteNPagedLookasideList(&Target->IndirectList);
 
-    ASSERT3U(Target->Signature, ==, TARGET_SIGNATURE);
+    RtlZeroMemory(&Target->Fresh, sizeof(LIST_ENTRY));
+    RtlZeroMemory(&Target->Prepared, sizeof(LIST_ENTRY));
+    RtlZeroMemory(&Target->Submitted, sizeof(LIST_ENTRY));
+    RtlZeroMemory(&Target->Shutdown, sizeof(LIST_ENTRY));
 
-    TargetD0ToD3(Target);
+    ThreadAlert(Target->BackendThread);
+    ThreadJoin(Target->BackendThread);
+    Target->BackendThread = NULL;
 
-    Verbose("Target[%d] : RequestListUsed %d\n", TargetId, Target->RequestList.Used);
-    Objects[0] = &Target->RequestList.Empty;
-    Objects[1] = &Target->SegmentList.Empty;
-    Objects[2] = &Target->IndirectList.Empty;
+    BlockRingDestroy(Target->BlockRing);
+    Target->BlockRing = NULL;
 
-    WaitBlock = (PKWAIT_BLOCK)__TargetAlloc(sizeof(KWAIT_BLOCK) * ARRAYSIZE(Objects));
-    if (WaitBlock == NULL) {
-        ULONG   Index;
+    GranterDestroy(Target->Granter);
+    Target->Granter = NULL;
 
-        Error("Unable to allocate resources for KWAIT_BLOCK\n");
+    __TargetFree(Target->BackendPath);
+    Target->BackendPath = NULL;
 
-        for (Index = 0; Index < ARRAYSIZE(Objects); Index++)
-            KeWaitForSingleObject(Objects[Index],
-                                  Executive,
-                                  KernelMode,
-                                  FALSE,
-                                  NULL);
-    } else {
-        KeWaitForMultipleObjects(ARRAYSIZE(Objects),
-                                 Objects,
-                                 WaitAll,
-                                 Executive,
-                                 KernelMode,
-                                 FALSE,
-                                 NULL,
-                                 WaitBlock);
-#pragma prefast(suppress:6102)
-        __TargetFree(WaitBlock);
-    }
+    __TargetFree(Target->TargetPath);
+    Target->TargetPath = NULL;
 
-    ASSERT3U(TargetGetDevicePnpState(Target), ==, Deleted);
+    __TargetFree(Target->Path);
+    Target->Path = NULL;
 
-    FrontendDestroy(Target->Frontend);
-    Target->Frontend = NULL;
+    RtlZeroMemory(&Target->DebugInterface, sizeof(XENBUS_DEBUG_INTERFACE));
+    RtlZeroMemory(&Target->StoreInterface, sizeof(XENBUS_STORE_INTERFACE));
+    RtlZeroMemory(&Target->SuspendInterface, sizeof(XENBUS_SUSPEND_INTERFACE));
 
-    __LookasideTerm(&Target->IndirectList);
-    __LookasideTerm(&Target->SegmentList);
-    __LookasideTerm(&Target->RequestList);
+    Target->Adapter         = NULL;
+    Target->DeviceObject    = NULL; // filled in later
+    Target->DevicePnpState  = 0;
+    Target->DevicePowerState = 0;
+    Target->DeviceId        = 0;
+    Target->TargetId        = 0;
+    Target->State           = 0;
+    Target->BackendId       = 0;
+    RtlZeroMemory(&Target->QueueLock, sizeof(KSPIN_LOCK));
+    RtlZeroMemory(&Target->StateLock, sizeof(KSPIN_LOCK));
 
-    ASSERT3U(Target->Signature, ==, TARGET_SIGNATURE);
-    RtlZeroMemory(Target, sizeof(XENVBD_TARGET));
+    ASSERT(IsZeroMemory(Target, sizeof(XENVBD_TARGET)));
     __TargetFree(Target);
-
-    Verbose("Target[%d] : Destroyed\n", TargetId);
-    Trace("Target[%d] @ (%d) <=====\n", TargetId, KeGetCurrentIrql());
 }
