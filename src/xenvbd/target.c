@@ -397,7 +397,7 @@ TargetPrepareRW(
     IN  UCHAR           Operation
     )
 {
-    PSCSI_REQUEST_BLOCK Srb = SrbExt->Srb;
+    PSCSI_REQUEST_BLOCK Srb = SrbExt->OriginalReq;
     ULONG64             SectorStart = Cdb_LogicalBlock(Srb);
     ULONG               SectorsLeft = Cdb_TransferBlock(Srb);
     LIST_ENTRY          List;
@@ -584,7 +584,7 @@ TargetPrepareUnmap(
     IN  PXENVBD_SRBEXT  SrbExt
     )
 {
-    PSCSI_REQUEST_BLOCK Srb = SrbExt->Srb;
+    PSCSI_REQUEST_BLOCK Srb = SrbExt->OriginalReq;
     PUNMAP_LIST_HEADER  Unmap = Srb->DataBuffer;
 	ULONG               Count;
     ULONG               Index;
@@ -651,7 +651,7 @@ TargetPrepareSync(
     IN  UCHAR           Operation
     )
 {
-    PSCSI_REQUEST_BLOCK Srb = SrbExt->Srb;
+    PSCSI_REQUEST_BLOCK Srb = SrbExt->OriginalReq;
     PXENVBD_REQUEST     Request;
     KIRQL               Irql;
 
@@ -680,10 +680,10 @@ TargetPrepareRequest(
     IN  PXENVBD_SRBEXT  SrbExt
     )
 {
-    PSCSI_REQUEST_BLOCK Srb = SrbExt->Srb;
+    PSCSI_REQUEST_BLOCK Srb = SrbExt->OriginalReq;
     UCHAR               Operation;
 
-    Operation = Cdb_OperationEx(SrbExt->Srb);
+    Operation = Cdb_OperationEx(Srb);
     switch (Operation) {
     case SCSIOP_READ:
         return TargetPrepareRW(Target, SrbExt, BLKIF_OP_READ);
@@ -793,9 +793,10 @@ TargetCompleteShutdown(
         return;
 
     for (;;) {
-        PLIST_ENTRY     ListEntry;
-        PXENVBD_SRBEXT  SrbExt;
-        KIRQL           Irql;
+        PLIST_ENTRY         ListEntry;
+        PXENVBD_SRBEXT      SrbExt;
+        PSCSI_REQUEST_BLOCK Srb;
+        KIRQL               Irql;
 
         KeAcquireSpinLock(&Target->QueueLock, &Irql);
         ListEntry = RemoveHeadList(&Target->Shutdown);
@@ -806,7 +807,8 @@ TargetCompleteShutdown(
         KeReleaseSpinLock(&Target->QueueLock, Irql);
 
         SrbExt = CONTAINING_RECORD(ListEntry, XENVBD_SRBEXT, ListEntry);
-        SrbExt->Srb->SrbStatus = SRB_STATUS_SUCCESS;
+        Srb = SrbExt->OriginalReq;
+        Srb->SrbStatus = SRB_STATUS_SUCCESS;
         AdapterCompleteSrb(TargetGetAdapter(Target), SrbExt);
     }
 }
@@ -855,7 +857,7 @@ TargetDisableFeature(
     }
 }
 
-VOID
+BOOLEAN
 TargetCompleteResponse(
     IN  PXENVBD_TARGET  Target,
     IN  ULONG64         Id,
@@ -867,6 +869,9 @@ TargetCompleteResponse(
     PXENVBD_SRBEXT      SrbExt;
     PSCSI_REQUEST_BLOCK Srb;
     KIRQL               Irql;
+
+    if (Id == 0)
+        return FALSE;
 
     KeAcquireSpinLock(&Target->QueueLock, &Irql);
     Request = NULL;
@@ -886,10 +891,12 @@ TargetCompleteResponse(
     }
     KeReleaseSpinLock(&Target->QueueLock, Irql);
 
-    ASSERT3P(Request, !=, NULL);
+    if (Request == NULL)
+        return FALSE;
+
     SrbExt = Request->SrbExt;
     ASSERT3P(SrbExt, !=, NULL);
-    Srb = SrbExt->Srb;
+    Srb = SrbExt->OriginalReq;
     ASSERT3P(Srb, !=, NULL);
 
     switch (Status) {
@@ -922,12 +929,13 @@ TargetCompleteResponse(
     TargetPutRequest(Target, Request);
 
     if (InterlockedDecrement(&SrbExt->RequestCount) != 0)
-        return;
+        return TRUE;
 
     if (Srb->SrbStatus == SRB_STATUS_PENDING)
         Srb->SrbStatus = SRB_STATUS_SUCCESS;
 
     AdapterCompleteSrb(Target->Adapter, SrbExt);
+    return TRUE;
 }
 
 VOID
@@ -954,9 +962,10 @@ TargetFlush(
     IN  PXENVBD_SRBEXT  SrbExt
     )
 {
+    PSCSI_REQUEST_BLOCK Srb = SrbExt->OriginalReq;
     KIRQL               Irql;
 
-    SrbExt->Srb->SrbStatus = SRB_STATUS_PENDING;
+    Srb->SrbStatus = SRB_STATUS_PENDING;
 
     KeAcquireSpinLock(&Target->QueueLock, &Irql);
     InsertTailList(&Target->Shutdown, &SrbExt->ListEntry);
@@ -971,9 +980,10 @@ TargetShutdown(
     IN  PXENVBD_SRBEXT  SrbExt
     )
 {
+    PSCSI_REQUEST_BLOCK Srb = SrbExt->OriginalReq;
     KIRQL               Irql;
 
-    SrbExt->Srb->SrbStatus = SRB_STATUS_PENDING;
+    Srb->SrbStatus = SRB_STATUS_PENDING;
 
     KeAcquireSpinLock(&Target->QueueLock, &Irql);
     InsertTailList(&Target->Shutdown, &SrbExt->ListEntry);
@@ -988,7 +998,7 @@ TargetPrepareSrb(
     IN  PXENVBD_SRBEXT  SrbExt
     )
 {
-    PSCSI_REQUEST_BLOCK Srb = SrbExt->Srb;
+    PSCSI_REQUEST_BLOCK Srb = SrbExt->OriginalReq;
 
     UNREFERENCED_PARAMETER(Target);
 
@@ -1001,9 +1011,10 @@ TargetQueueSrb(
     IN  PXENVBD_SRBEXT  SrbExt
     )
 {
+    PSCSI_REQUEST_BLOCK Srb = SrbExt->OriginalReq;
     KIRQL               Irql;
 
-    SrbExt->Srb->SrbStatus = SRB_STATUS_PENDING;
+    Srb->SrbStatus = SRB_STATUS_PENDING;
 
     KeAcquireSpinLock(&Target->QueueLock, &Irql);
     InsertTailList(&Target->Fresh, &SrbExt->ListEntry);
@@ -1018,7 +1029,7 @@ TargetInquiryStd(
     IN  PXENVBD_SRBEXT  SrbExt
     )
 {
-    PSCSI_REQUEST_BLOCK Srb = SrbExt->Srb;
+    PSCSI_REQUEST_BLOCK Srb = SrbExt->OriginalReq;
     PINQUIRYDATA        Data = Srb->DataBuffer;
    
     UNREFERENCED_PARAMETER(Target);
@@ -1048,7 +1059,7 @@ TargetInquiry00(
     IN  PXENVBD_SRBEXT  SrbExt
     )
 {
-    PSCSI_REQUEST_BLOCK Srb = SrbExt->Srb;
+    PSCSI_REQUEST_BLOCK Srb = SrbExt->OriginalReq;
     PUCHAR              Data = Srb->DataBuffer;
 
     UNREFERENCED_PARAMETER(Target);
@@ -1072,7 +1083,7 @@ TargetInquiry80(
     IN  PXENVBD_SRBEXT      SrbExt
     )
 {
-    PSCSI_REQUEST_BLOCK     Srb = SrbExt->Srb;
+    PSCSI_REQUEST_BLOCK     Srb = SrbExt->OriginalReq;
     PVPD_SERIAL_NUMBER_PAGE Data = Srb->DataBuffer;
    
     Srb->SrbStatus = SRB_STATUS_DATA_OVERRUN;
@@ -1094,7 +1105,7 @@ TargetInquiry83(
     IN  PXENVBD_SRBEXT      SrbExt
     )
 {
-    PSCSI_REQUEST_BLOCK         Srb = SrbExt->Srb;
+    PSCSI_REQUEST_BLOCK         Srb = SrbExt->OriginalReq;
     PVPD_IDENTIFICATION_PAGE    Data = Srb->DataBuffer;
     PVPD_IDENTIFICATION_DESCRIPTOR  Descr;
 
@@ -1128,17 +1139,19 @@ TargetInquiry(
     IN  PXENVBD_SRBEXT  SrbExt
     )
 {
-    if (Cdb_EVPD(SrbExt->Srb)) {
-        switch (Cdb_PageCode(SrbExt->Srb)) {
-        case 0x00:  TargetInquiry00(Target, SrbExt);            break;
-        case 0x80:  TargetInquiry80(Target, SrbExt);            break;
-        case 0x83:  TargetInquiry83(Target, SrbExt);            break;
-        default:    SrbExt->Srb->SrbStatus = SRB_STATUS_ERROR;  break;
+    PSCSI_REQUEST_BLOCK Srb = SrbExt->OriginalReq;
+
+    if (Cdb_EVPD(Srb)) {
+        switch (Cdb_PageCode(Srb)) {
+        case 0x00:  TargetInquiry00(Target, SrbExt);    break;
+        case 0x80:  TargetInquiry80(Target, SrbExt);    break;
+        case 0x83:  TargetInquiry83(Target, SrbExt);    break;
+        default:    Srb->SrbStatus = SRB_STATUS_ERROR;  break;
         }
     } else {
-        switch (Cdb_PageCode(SrbExt->Srb)) {
-        case 0x00:  TargetInquiryStd(Target, SrbExt);           break;
-        default:    SrbExt->Srb->SrbStatus = SRB_STATUS_ERROR;  break;
+        switch (Cdb_PageCode(Srb)) {
+        case 0x00:  TargetInquiryStd(Target, SrbExt);   break;
+        default:    Srb->SrbStatus = SRB_STATUS_ERROR;  break;
         }
     }
 }
@@ -1149,7 +1162,7 @@ TargetModeSense(
     IN  PXENVBD_SRBEXT      SrbExt
     )
 {
-    PSCSI_REQUEST_BLOCK     Srb = SrbExt->Srb;
+    PSCSI_REQUEST_BLOCK     Srb = SrbExt->OriginalReq;
     PMODE_PARAMETER_HEADER  Header;
     ULONG                   Offset;
     UCHAR                   PageCode;
@@ -1213,7 +1226,7 @@ TargetRequestSense(
     IN  PXENVBD_SRBEXT  SrbExt
     )
 {
-    PSCSI_REQUEST_BLOCK Srb = SrbExt->Srb;
+    PSCSI_REQUEST_BLOCK Srb = SrbExt->OriginalReq;
     PSENSE_DATA         Sense = Srb->DataBuffer;
 
     UNREFERENCED_PARAMETER(Target);
@@ -1238,7 +1251,7 @@ TargetReportLuns(
     IN  PXENVBD_SRBEXT  SrbExt
     )
 {
-    PSCSI_REQUEST_BLOCK Srb = SrbExt->Srb;
+    PSCSI_REQUEST_BLOCK Srb = SrbExt->OriginalReq;
     ULONG               Length;
     ULONG               Offset;
     ULONG               AllocLength = Cdb_AllocationLength(Srb);
@@ -1278,7 +1291,7 @@ TargetReadCapacity(
     IN  PXENVBD_SRBEXT  SrbExt
     )
 {
-    PSCSI_REQUEST_BLOCK Srb = SrbExt->Srb;
+    PSCSI_REQUEST_BLOCK Srb = SrbExt->OriginalReq;
     PREAD_CAPACITY_DATA Capacity = Srb->DataBuffer;
     ULONG64             SectorCount = Target->SectorCount;
     ULONG               SectorSize = Target->SectorSize;
@@ -1311,7 +1324,7 @@ TargetReadCapacity16(
     IN  PXENVBD_SRBEXT      SrbExt
     )
 {
-    PSCSI_REQUEST_BLOCK     Srb = SrbExt->Srb;
+    PSCSI_REQUEST_BLOCK     Srb = SrbExt->OriginalReq;
     PREAD_CAPACITY16_DATA   Capacity = Srb->DataBuffer;
     ULONG64                 SectorCount = Target->SectorCount;
     ULONG                   SectorSize = Target->SectorSize;
@@ -1345,8 +1358,9 @@ TargetCheckSectors(
     IN  PXENVBD_SRBEXT  SrbExt
     )
 {
-    ULONG64             StartSector = Cdb_LogicalBlock(SrbExt->Srb);
-    ULONG               SectorCount = Cdb_TransferBlock(SrbExt->Srb);
+    PSCSI_REQUEST_BLOCK Srb = SrbExt->OriginalReq;
+    ULONG64             StartSector = Cdb_LogicalBlock(Srb);
+    ULONG               SectorCount = Cdb_TransferBlock(Srb);
 
     // prevent read/write beyond the end of the disk
     if (StartSector >= Target->SectorCount)
@@ -1362,7 +1376,7 @@ TargetStartSrb(
     IN  PXENVBD_SRBEXT  SrbExt
     )
 {
-    PSCSI_REQUEST_BLOCK Srb = SrbExt->Srb;
+    PSCSI_REQUEST_BLOCK Srb = SrbExt->OriginalReq;
     UCHAR               Operation;
 
     Operation = Cdb_OperationEx(Srb);
@@ -2374,26 +2388,28 @@ TargetSuspendCallback(
     // Fresh SRBs will be ok
     InitializeListHead(&List);
     for (;;) {
-        PLIST_ENTRY     ListEntry;
-        PXENVBD_REQUEST Request;
-        PXENVBD_SRBEXT  SrbExt;
+        PLIST_ENTRY         ListEntry;
+        PXENVBD_REQUEST     Request;
+        PXENVBD_SRBEXT      SrbExt;
+        PSCSI_REQUEST_BLOCK Srb;
 
         ListEntry = RemoveHeadList(&Target->Submitted);
         if (ListEntry == &Target->Submitted)
             break;
         Request = CONTAINING_RECORD(ListEntry, XENVBD_REQUEST, ListEntry);
         SrbExt = Request->SrbExt;
+        Srb = SrbExt->OriginalReq;
 
         TargetPutRequest(Target, Request);
         if (InterlockedDecrement(&SrbExt->RequestCount) == 0) {
-            SrbExt->Srb->SrbStatus = SRB_STATUS_ABORTED;
+            Srb->SrbStatus = SRB_STATUS_ABORTED;
             AdapterCompleteSrb(Target->Adapter, SrbExt);
         }
     }
     for (;;) {
-        PLIST_ENTRY     ListEntry;
-        PXENVBD_REQUEST Request;
-        PXENVBD_SRBEXT  SrbExt;
+        PLIST_ENTRY         ListEntry;
+        PXENVBD_REQUEST     Request;
+        PXENVBD_SRBEXT      SrbExt;
 
         ListEntry = RemoveHeadList(&Target->Prepared);
         if (ListEntry == &Target->Prepared)

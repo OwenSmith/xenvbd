@@ -33,12 +33,10 @@
 #define _XENVBD_SRBEXT_H
 
 #include <ntddk.h>
-#include <xenvbd-storport.h>
 #include <xen.h>
-#include "assert.h"
 
 typedef struct _XENVBD_SRBEXT {
-    PSCSI_REQUEST_BLOCK     Srb;
+    PVOID                   OriginalReq;
     LIST_ENTRY              ListEntry;
     LONG                    RequestCount;
     // ScatterGather
@@ -50,9 +48,9 @@ typedef struct _XENVBD_SRBEXT {
 typedef struct _XENVBD_REQUEST {
     PXENVBD_SRBEXT          SrbExt;
     LIST_ENTRY              ListEntry;
-    ULONG64                 Id; // = (ULONG64)(ULONG_PTR)this
+    ULONG64                 Id;         // = (ULONG64)(ULONG_PTR)this
 
-    UCHAR                   Operation;  // BLKIF_OP_{READ/WRITE/BARRIER/DISCARD}
+    UCHAR                   Operation;  // BLKIF_OP_{READ/WRITE/BARRIER/FLUSH/DISCARD}
     UCHAR                   Flags;      // BLKIF_OP_DISCARD only
     USHORT                  NrSegments; // BLKIF_OP_{READ/WRITE} only, 0-11 (direct) or 11-4096 (indirect)
     LIST_ENTRY              Segments;   // BLKIF_OP_{READ/WRITE} only

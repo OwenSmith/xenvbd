@@ -592,21 +592,18 @@ BlockRingPoll(
             blkif_response_t*   rsp;
 
             rsp = RING_GET_RESPONSE(&BlockRing->Front, rsp_cons);
-            if (rsp->id == 0) {
-                Warning("Bad Response (%llu, %u, &d) @ slot %u\n",
-                        rsp->id,
-                        rsp->operation,
-                        rsp->status,
-                        rsp_cons & (RING_SIZE(&BlockRing->Front) - 1));
-                // dump submitted reqs?
-            } else {
-                TargetCompleteResponse(BlockRing->Target,
-                                       rsp->id,
-                                       rsp->status);
-                ++BlockRing->Completed;
-            }
             ++rsp_cons;
 
+            if (!TargetCompleteResponse(BlockRing->Target,
+                                        rsp->id,
+                                        rsp->status)) {
+                XENBUS_DEBUG(Trigger,
+                             &BlockRing->DebugInterface,
+                             BlockRing->DebugCallback);
+            }
+            ++BlockRing->Completed;
+
+            // zero entire ring slot (to detect further failures)
             RtlZeroMemory(rsp, sizeof(union blkif_sring_entry));
         }
 

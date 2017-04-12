@@ -142,7 +142,7 @@ TargetSubmitRequests(
     IN  PXENVBD_TARGET  Target
     );
 
-extern VOID
+extern BOOLEAN
 TargetCompleteResponse(
     IN  PXENVBD_TARGET  Target,
     IN  ULONG64         Id,

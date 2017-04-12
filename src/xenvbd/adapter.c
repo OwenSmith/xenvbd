@@ -1481,7 +1481,7 @@ AdapterCompleteSrb(
     IN  PXENVBD_SRBEXT  SrbExt
     )
 {
-    PSCSI_REQUEST_BLOCK Srb = SrbExt->Srb;
+    PSCSI_REQUEST_BLOCK Srb = SrbExt->OriginalReq;
 
     ASSERT3U(Srb->SrbStatus, !=, SRB_STATUS_PENDING);
 
@@ -1574,7 +1574,7 @@ AdapterHwBuildIo(
     PXENVBD_TARGET          Target;
 
     RtlZeroMemory(SrbExt, sizeof(XENVBD_SRBEXT));
-    SrbExt->Srb = Srb;
+    SrbExt->OriginalReq = Srb;
     InitializeListHead(&SrbExt->ListEntry);
 
     switch (Srb->Function) {
