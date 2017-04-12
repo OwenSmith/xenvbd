@@ -65,6 +65,15 @@ AdapterIsTargetEmulated(
     );
 
 extern VOID
+AdapterGetNextSGEntry(
+    IN  PXENVBD_SRBEXT  SrbExt,
+    IN  ULONG           ExistingLength,
+    OUT PPFN_NUMBER     Pfn,
+    OUT PULONG          Offset,
+    OUT PULONG          Length
+    );
+
+extern VOID
 AdapterCompleteSrb(
     IN  PXENVBD_ADAPTER Adapter,
     IN  PXENVBD_SRBEXT  SrbExt

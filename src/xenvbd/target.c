@@ -123,92 +123,6 @@ struct _XENVBD_TARGET {
     NPAGED_LOOKASIDE_LIST       IndirectList;
 };
 
-typedef struct _XENVBD_SG_LIST {
-    // SGList from SRB
-    PSTOR_SCATTER_GATHER_LIST   SGList;
-    // "current" values
-    STOR_PHYSICAL_ADDRESS       PhysAddr;
-    ULONG                       PhysLen;
-    // iteration
-    ULONG                       Index;
-    ULONG                       Offset;
-    ULONG                       Length;
-} XENVBD_SG_LIST, *PXENVBD_SG_LIST;
-
-static FORCEINLINE VOID
-SGListInit(
-    IN OUT  PXENVBD_SG_LIST     SGList,
-    IN  PVOID                   Adapter,
-    IN  PSCSI_REQUEST_BLOCK     Srb
-    )
-{
-    RtlZeroMemory(SGList, sizeof(XENVBD_SG_LIST));
-    SGList->SGList = StorPortGetScatterGatherList(Adapter, Srb);
-}
-
-static FORCEINLINE VOID
-SGListGet(
-    IN OUT  PXENVBD_SG_LIST         SGList
-    )
-{
-    PSTOR_SCATTER_GATHER_ELEMENT    SGElement;
-    ULONG                           Offset;
-
-    ASSERT3U(SGList->Index, <, SGList->SGList->NumberOfElements);
-
-    SGElement = &SGList->SGList->List[SGList->Index];
-
-    SGList->PhysAddr.QuadPart = SGElement->PhysicalAddress.QuadPart + SGList->Offset;
-    Offset = (ULONG)(SGList->PhysAddr.QuadPart & (PAGE_SIZE - 1));
-    SGList->PhysLen           = __min(PAGE_SIZE - Offset - SGList->Length,
-                                      SGElement->Length - SGList->Offset);
-
-    ASSERT3U(SGList->PhysLen, <=, PAGE_SIZE);
-    ASSERT3U(SGList->Offset, <, SGElement->Length);
-
-    SGList->Length = SGList->PhysLen; // gets reset every time for Granted, every 1or2 times for Bounced
-    SGList->Offset = SGList->Offset + SGList->PhysLen;
-    if (SGList->Offset >= SGElement->Length) {
-        SGList->Index  = SGList->Index + 1;
-        SGList->Offset = 0;
-    }
-}
-
-static FORCEINLINE BOOLEAN
-SGListNext(
-    IN OUT  PXENVBD_SG_LIST         SGList,
-    IN  ULONG                       AlignmentMask
-    )
-{
-    SGList->Length = 0;
-    SGListGet(SGList);  // get next PhysAddr and PhysLen
-    return !((SGList->PhysAddr.QuadPart & AlignmentMask) || (SGList->PhysLen & AlignmentMask));
-}
-
-static FORCEINLINE PFN_NUMBER
-SGListPfn(
-    IN  PXENVBD_SG_LIST SGList
-    )
-{
-    return (PFN_NUMBER)(SGList->PhysAddr.QuadPart >> PAGE_SHIFT);
-}
-
-static FORCEINLINE ULONG
-SGListOffset(
-    IN  PXENVBD_SG_LIST SGList
-    )
-{
-    return (ULONG)(SGList->PhysAddr.QuadPart & (PAGE_SIZE - 1));
-}
-
-static FORCEINLINE ULONG
-SGListLength(
-    IN  PXENVBD_SG_LIST SGList
-    )
-{
-    return SGList->PhysLen;
-}
-
 static FORCEINLINE PVOID
 __TargetAllocate(
     IN  ULONG   Size
@@ -476,58 +390,6 @@ TargetPutRequest(
     ExFreeToNPagedLookasideList(&Target->RequestList, Request);
 }
 
-static FORCEINLINE BOOLEAN
-BufferMap(
-    IN  PXENVBD_SEGMENT Segment,
-    IN  PXENVBD_SG_LIST SGList,
-    IN  ULONG           Length
-    )
-{
-    // map PhysAddr to 1 or 2 pages and lock for VirtAddr
-#pragma warning(push)
-#pragma warning(disable:28145)
-    Segment->Mdl.Next           = NULL;
-    Segment->Mdl.Size           = (SHORT)(sizeof(MDL) + sizeof(PFN_NUMBER));
-    Segment->Mdl.MdlFlags       = MDL_PAGES_LOCKED;
-    Segment->Mdl.Process        = NULL;
-    Segment->Mdl.MappedSystemVa = NULL;
-    Segment->Mdl.StartVa        = NULL;
-    Segment->Mdl.ByteCount      = SGListLength(SGList);
-    Segment->Mdl.ByteOffset     = SGListOffset(SGList);
-    Segment->Pfn[0]             = SGListPfn(SGList);
-
-    if (Segment->Mdl.ByteCount < Length) {
-        // need part of next page
-        SGListGet(SGList);
-        Segment->Mdl.Size       += sizeof(PFN_NUMBER);
-        Segment->Mdl.ByteCount  = Segment->Mdl.ByteCount + SGListLength(SGList);
-        Segment->Pfn[1]         = SGListPfn(SGList);
-    }
-#pragma warning(pop)
-
-    ASSERT3U(Segment->Mdl.ByteCount, <=, PAGE_SIZE);
-    ASSERT3U(Segment->Mdl.ByteCount, ==, Length);
-                
-    Segment->Length = min(Segment->Mdl.ByteCount, PAGE_SIZE);
-    Segment->Buffer = MmMapLockedPagesSpecifyCache(&Segment->Mdl,
-                                                   KernelMode,
-                                                   MmCached,
-                                                   NULL,
-                                                   FALSE,
-                                                   NormalPagePriority);
-    if (Segment->Buffer == NULL)
-        goto fail;
-
-    ASSERT3P(MmGetMdlPfnArray(&Segment->Mdl)[0], ==, Segment->Pfn[0]);
-    // if only 1 Pfn is used, this triggers an array-out-of-bounds condition!
-    //ASSERT3P(MmGetMdlPfnArray(&Segment->Mdl)[1], ==, Segment->Pfn[1]);
- 
-    return TRUE;
-
-fail:
-    return FALSE;
-}
-
 static BOOLEAN
 TargetPrepareRW(
     IN  PXENVBD_TARGET  Target,
@@ -539,16 +401,12 @@ TargetPrepareRW(
     ULONG64             SectorStart = Cdb_LogicalBlock(Srb);
     ULONG               SectorsLeft = Cdb_TransferBlock(Srb);
     LIST_ENTRY          List;
-    XENVBD_SG_LIST      SGList;
     KIRQL               Irql;
     const ULONG         SectorSize = Target->SectorSize;
     const ULONG         SectorMask = SectorSize - 1;
     const ULONG         SectorsPerPage = PAGE_SIZE / SectorSize;
 
     InitializeListHead(&List);
-    SGListInit(&SGList, TargetGetAdapter(Target), Srb);
-
-    // validate SectorStart, SectorsLeft fits in this target (prevent read/write beyond extents)
 
     while (SectorsLeft > 0) {
         PXENVBD_REQUEST Request;
@@ -576,6 +434,8 @@ TargetPrepareRW(
             PXENVBD_SEGMENT Segment;
             ULONG           SectorsNow;
             PFN_NUMBER      Pfn;
+            ULONG           Offset;
+            ULONG           Length;
             NTSTATUS        status;
 
             if (SectorsLeft == 0)
@@ -587,23 +447,59 @@ TargetPrepareRW(
             InsertTailList(&Request->Segments, &Segment->ListEntry);
             ++Request->NrSegments;
 
-            if (SGListNext(&SGList, SectorMask)) {
-                ASSERT((SGListOffset(&SGList) & SectorMask) == 0);
-
-                Segment->FirstSector = (UCHAR)(SGListOffset(&SGList) / SectorSize);
+            AdapterGetNextSGEntry(SrbExt,
+                                  0,
+                                  &Pfn,
+                                  &Offset,
+                                  &Length);
+            if ((Offset & SectorMask) == 0 && (Length & SectorMask) == 0) {
+                Segment->FirstSector = (UCHAR)(Offset / SectorSize);
                 SectorsNow           = min(SectorsLeft, SectorsPerPage - Segment->FirstSector);
                 Segment->LastSector  = (UCHAR)(Segment->FirstSector + SectorsNow - 1);
-
-                Pfn = SGListPfn(&SGList);
             } else {
-                ASSERT((SGListOffset(&SGList) & SectorMask) != 0);
-
                 Segment->FirstSector = (UCHAR)0;
                 SectorsNow           = min(SectorsLeft, SectorsPerPage);
                 Segment->LastSector  = (UCHAR)(SectorsNow - 1);
 
-                if (!BufferMap(Segment, &SGList, SectorsNow * SectorSize))
+                // map PhysAddr to 1 or 2 pages and lock for VirtAddr
+#pragma warning(push)
+#pragma warning(disable:28145)
+                Segment->Mdl.Size           = (SHORT)(sizeof(MDL) + sizeof(PFN_NUMBER));
+                Segment->Mdl.MdlFlags       = MDL_PAGES_LOCKED;
+                Segment->Mdl.ByteCount      = Length;
+                Segment->Mdl.ByteOffset     = Offset;
+                Segment->Pfn[0]             = Pfn;
+
+                if (Segment->Mdl.ByteCount < SectorsNow * SectorSize) {
+                    // need part of next page
+                    AdapterGetNextSGEntry(SrbExt,
+                                          Length,
+                                          &Pfn,
+                                          &Offset,
+                                          &Length);
+                    ASSERT(Offset == 0);
+                    Segment->Mdl.Size       += sizeof(PFN_NUMBER);
+                    Segment->Mdl.ByteCount  = Segment->Mdl.ByteCount + Length;
+                    Segment->Pfn[1]         = Pfn;
+                }
+#pragma warning(pop)
+
+                ASSERT3U(Segment->Mdl.ByteCount, <=, PAGE_SIZE);
+                ASSERT3U(Segment->Mdl.ByteCount, ==, SectorsNow * SectorSize);
+
+                Segment->Length = Segment->Mdl.ByteCount;
+                Segment->Buffer = MmMapLockedPagesSpecifyCache(&Segment->Mdl,
+                                                               KernelMode,
+                                                               MmCached,
+                                                               NULL,
+                                                               FALSE,
+                                                               NormalPagePriority);
+                if (Segment->Buffer == NULL)
                     goto fail3;
+
+                ASSERT3P(MmGetMdlPfnArray(&Segment->Mdl)[0], ==, Segment->Pfn[0]);
+                // if only 1 Pfn is used, this triggers an array-out-of-bounds condition!
+                //ASSERT3P(MmGetMdlPfnArray(&Segment->Mdl)[1], ==, Segment->Pfn[1]);
 
                 if (!BufferGet(Segment, &Segment->BufferId, &Pfn))
                     goto fail4;

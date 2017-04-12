@@ -1405,9 +1405,21 @@ AdapterPullupSrb(
     IN  PSCSI_REQUEST_BLOCK Srb
     )
 {
-    // walk ScatterGather list, add bounces where needed
-    UNREFERENCED_PARAMETER(Adapter);
-    UNREFERENCED_PARAMETER(Srb);
+    PXENVBD_SRBEXT          SrbExt = Srb->SrbExtension;
+    UCHAR                   Operation;
+
+    Operation = Cdb_OperationEx(Srb);
+    switch (Operation) {
+    case SCSIOP_READ:
+    case SCSIOP_WRITE:
+        break;
+    default:
+        // only need to pullup for read/write
+        return TRUE;
+    }
+
+    SrbExt->SGList = StorPortGetScatterGatherList(Adapter, Srb);
+
     return TRUE;
 }
 
@@ -1417,9 +1429,50 @@ AdapterPulldownSrb(
     IN  PSCSI_REQUEST_BLOCK Srb
     )
 {
-    // foreach ScatterGather entry, unbounce it
+    PXENVBD_SRBEXT          SrbExt = Srb->SrbExtension;
+
     UNREFERENCED_PARAMETER(Adapter);
-    UNREFERENCED_PARAMETER(Srb);
+
+    SrbExt->SGList = NULL;
+    SrbExt->SGIndex = 0;
+    SrbExt->SGOffset = 0;
+}
+
+VOID
+AdapterGetNextSGEntry(
+    IN  PXENVBD_SRBEXT              SrbExt,
+    IN  ULONG                       ExistingLength,
+    OUT PPFN_NUMBER                 Pfn,
+    OUT PULONG                      Offset,
+    OUT PULONG                      Length
+    )
+{
+    PSTOR_SCATTER_GATHER_LIST       SGList;
+    PSTOR_SCATTER_GATHER_ELEMENT    SGElement;
+    STOR_PHYSICAL_ADDRESS           Addr;
+
+    SGList = SrbExt->SGList;
+    ASSERT(SGList != NULL);
+
+    ASSERT3U(SrbExt->SGIndex, <, SGList->NumberOfElements);
+
+    SGElement = &SGList->List[SrbExt->SGIndex];
+
+    Addr.QuadPart = SGElement->PhysicalAddress.QuadPart + SrbExt->SGOffset;
+
+    *Pfn    = (PFN_NUMBER)(Addr.QuadPart >> PAGE_SHIFT);
+    *Offset = (ULONG)(Addr.QuadPart & (PAGE_SIZE - 1));
+    *Length = __min(PAGE_SIZE - *Offset - ExistingLength,
+                    SGElement->Length - SrbExt->SGOffset);
+
+    ASSERT3U(*Length, <=, PAGE_SIZE);
+    ASSERT3U(SrbExt->SGOffset, <, SGElement->Length);
+
+    SrbExt->SGOffset += *Length;
+    if (SrbExt->SGOffset >= SGElement->Length) {
+        SrbExt->SGIndex++;
+        SrbExt->SGOffset = 0;
+    }
 }
 
 VOID

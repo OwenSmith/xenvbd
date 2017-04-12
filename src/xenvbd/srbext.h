@@ -41,6 +41,10 @@ typedef struct _XENVBD_SRBEXT {
     PSCSI_REQUEST_BLOCK     Srb;
     LIST_ENTRY              ListEntry;
     LONG                    RequestCount;
+    // ScatterGather
+    PVOID                   SGList;
+    ULONG                   SGIndex;
+    ULONG                   SGOffset;
 } XENVBD_SRBEXT, *PXENVBD_SRBEXT;
 
 typedef struct _XENVBD_REQUEST {
