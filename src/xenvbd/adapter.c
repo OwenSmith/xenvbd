@@ -90,6 +90,11 @@ struct _XENVBD_ADAPTER {
     LONG                        BuildIo;
     LONG                        StartIo;
     LONG                        Completed;
+
+    BOOLEAN                     BarrierDisabled;
+    BOOLEAN                     DiscardDisabled;
+    BOOLEAN                     FlushDisabled;
+    BOOLEAN                     IndirectDisabled;
 };
 
 static FORCEINLINE PVOID
@@ -943,6 +948,11 @@ AdapterD3ToD0(
     if (!NT_SUCCESS(status))
         goto fail3;
 
+    Adapter->BarrierDisabled = DriverReadOverride("BarrierDisabled");
+    Adapter->DiscardDisabled = DriverReadOverride("DiscardDisabled");
+    Adapter->FlushDisabled   = DriverReadOverride("FlushDisabled");
+    Adapter->IndirectDisabled= DriverReadOverride("IndirectDisabled");
+
     status = __AdapterD3ToD0(Adapter);
     if (!NT_SUCCESS(status))
         goto fail4;
@@ -985,6 +995,11 @@ fail5:
 
 fail4:
     Error("fail4\n");
+
+    Adapter->BarrierDisabled = FALSE;
+    Adapter->DiscardDisabled = FALSE;
+    Adapter->FlushDisabled   = FALSE;
+    Adapter->IndirectDisabled= FALSE;
 
     XENBUS_DEBUG(Deregister,
                  &Adapter->DebugInterface,
@@ -1033,6 +1048,11 @@ AdapterD0ToD3(
     }
 
     __AdapterD0ToD3(Adapter);
+
+    Adapter->BarrierDisabled = FALSE;
+    Adapter->DiscardDisabled = FALSE;
+    Adapter->FlushDisabled   = FALSE;
+    Adapter->IndirectDisabled= FALSE;
 
     XENBUS_DEBUG(Deregister,
                  &Adapter->DebugInterface,
@@ -2071,3 +2091,19 @@ ADAPTER_GET_INTERFACE(Gnttab, PXENBUS_GNTTAB_INTERFACE)
 ADAPTER_GET_INTERFACE(Suspend, PXENBUS_SUSPEND_INTERFACE)
 
 #undef ADAPTER_GET_INTERFACE
+
+#define ADAPTER_GET_DISABLED(_name)         \
+BOOLEAN                                     \
+AdapterGet ## _name ## Disabled(            \
+    IN  PXENVBD_ADAPTER Adapter             \
+    )                                       \
+{                                           \
+    return Adapter-> ## _name ## Disabled;  \
+}
+
+ADAPTER_GET_DISABLED(Barrier)
+ADAPTER_GET_DISABLED(Discard)
+ADAPTER_GET_DISABLED(Flush)
+ADAPTER_GET_DISABLED(Indirect)
+
+#undef ADAPTER_GET_DISABLED

@@ -85,6 +85,27 @@ DriverGetParametersKey(
     return __DriverGetParametersKey();
 }
 
+BOOLEAN
+DriverReadOverride(
+    IN  PCHAR   Name
+    )
+{
+    ULONG       Value;
+    NTSTATUS    status;
+
+    status = RegistryQueryDwordValue(__DriverGetParametersKey(),
+                                     Name,
+                                     &Value);
+    if (!NT_SUCCESS(status))
+        goto done;
+
+    if (Value == 1)
+        return TRUE;
+
+done:
+    return FALSE;
+}
+
 NTSTATUS
 DriverDispatchPnp(
     IN  PDEVICE_OBJECT  DeviceObject,

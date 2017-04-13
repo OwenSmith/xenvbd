@@ -1545,62 +1545,74 @@ TargetStoreReadFeatures(
                      Buffer);
     }
 
-    status = XENBUS_STORE(Read,
-                          &Target->StoreInterface,
-                          NULL,
-                          Target->BackendPath,
-                          "feature-barrier",
-                          &Buffer);
-    if (NT_SUCCESS(status)) {
-        Target->FeatureBarrier = (BOOLEAN)strtoul(Buffer, NULL, 2);
+    if (AdapterGetBarrierDisabled(Target->Adapter)) {
+        Target->FeatureBarrier = FALSE;
+    } else {
+        status = XENBUS_STORE(Read,
+                              &Target->StoreInterface,
+                              NULL,
+                              Target->BackendPath,
+                              "feature-barrier",
+                              &Buffer);
+        if (NT_SUCCESS(status)) {
+            Target->FeatureBarrier = (BOOLEAN)strtoul(Buffer, NULL, 2);
 
-        XENBUS_STORE(Free,
-                     &Target->StoreInterface,
-                     Buffer);
+            XENBUS_STORE(Free,
+                         &Target->StoreInterface,
+                         Buffer);
+        }
     }
 
-    status = XENBUS_STORE(Read,
-                          &Target->StoreInterface,
-                          NULL,
-                          Target->BackendPath,
-                          "feature-flush-cache",
-                          &Buffer);
-    if (NT_SUCCESS(status)) {
-        Target->FeatureFlush = (BOOLEAN)strtoul(Buffer, NULL, 2);
+    if (AdapterGetFlushDisabled(Target->Adapter)) {
+        Target->FeatureFlush = FALSE;
+    } else {
+        status = XENBUS_STORE(Read,
+                              &Target->StoreInterface,
+                              NULL,
+                              Target->BackendPath,
+                              "feature-flush-cache",
+                              &Buffer);
+        if (NT_SUCCESS(status)) {
+            Target->FeatureFlush = (BOOLEAN)strtoul(Buffer, NULL, 2);
 
-        XENBUS_STORE(Free,
-                     &Target->StoreInterface,
-                     Buffer);
+            XENBUS_STORE(Free,
+                         &Target->StoreInterface,
+                         Buffer);
+        }
     }
 
-    status = XENBUS_STORE(Read,
-                          &Target->StoreInterface,
-                          NULL,
-                          Target->BackendPath,
-                          "feature-discard",
-                          &Buffer);
-    if (NT_SUCCESS(status)) {
-        Target->FeatureDiscard = (BOOLEAN)strtoul(Buffer, NULL, 2);
+    if (AdapterGetDiscardDisabled(Target->Adapter)) {
+        Target->FeatureDiscard = FALSE;
+    } else {
+        status = XENBUS_STORE(Read,
+                              &Target->StoreInterface,
+                              NULL,
+                              Target->BackendPath,
+                              "feature-discard",
+                              &Buffer);
+        if (NT_SUCCESS(status)) {
+            Target->FeatureDiscard = (BOOLEAN)strtoul(Buffer, NULL, 2);
 
-        XENBUS_STORE(Free,
-                     &Target->StoreInterface,
-                     Buffer);
-    }
+            XENBUS_STORE(Free,
+                         &Target->StoreInterface,
+                         Buffer);
+        }
 
-    status = XENBUS_STORE(Read,
-                          &Target->StoreInterface,
-                          NULL,
-                          Target->BackendPath,
-                          "discard-enable",
-                          &Buffer);
-    if (NT_SUCCESS(status)) {
-        BOOLEAN Enabled = (BOOLEAN)strtoul(Buffer, NULL, 2);
-        if (!Enabled)
-            Target->FeatureDiscard = FALSE;
+        status = XENBUS_STORE(Read,
+                              &Target->StoreInterface,
+                              NULL,
+                              Target->BackendPath,
+                              "discard-enable",
+                              &Buffer);
+        if (NT_SUCCESS(status)) {
+            BOOLEAN Enabled = (BOOLEAN)strtoul(Buffer, NULL, 2);
+            if (!Enabled)
+                Target->FeatureDiscard = FALSE;
 
-        XENBUS_STORE(Free,
-                     &Target->StoreInterface,
-                     Buffer);
+            XENBUS_STORE(Free,
+                         &Target->StoreInterface,
+                         Buffer);
+        }
     }
 
     status = XENBUS_STORE(Read,
@@ -1645,18 +1657,22 @@ TargetStoreReadFeatures(
                      Buffer);
     }
 
-    status = XENBUS_STORE(Read,
-                          &Target->StoreInterface,
-                          NULL,
-                          Target->BackendPath,
-                          "feature-max-indirect-segments",
-                          &Buffer);
-    if (NT_SUCCESS(status)) {
-        Target->FeatureIndirect = strtoul(Buffer, NULL, 10);
+    if (AdapterGetIndirectDisabled(Target->Adapter)) {
+        Target->FeatureIndirect = 0;
+    } else {
+        status = XENBUS_STORE(Read,
+                              &Target->StoreInterface,
+                              NULL,
+                              Target->BackendPath,
+                              "feature-max-indirect-segments",
+                              &Buffer);
+        if (NT_SUCCESS(status)) {
+            Target->FeatureIndirect = strtoul(Buffer, NULL, 10);
 
-        XENBUS_STORE(Free,
-                     &Target->StoreInterface,
-                     Buffer);
+            XENBUS_STORE(Free,
+                         &Target->StoreInterface,
+                         Buffer);
+        }
     }
 }
 

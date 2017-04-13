@@ -58,6 +58,19 @@ ADAPTER_GET_INTERFACE(Suspend, PXENBUS_SUSPEND_INTERFACE)
 
 #undef ADAPTER_GET_INTERFACE
 
+#define ADAPTER_GET_DISABLED(_name)         \
+extern BOOLEAN                              \
+AdapterGet ## _name ## Disabled(            \
+    IN  PXENVBD_ADAPTER Adapter             \
+    );
+
+ADAPTER_GET_DISABLED(Barrier)
+ADAPTER_GET_DISABLED(Discard)
+ADAPTER_GET_DISABLED(Flush)
+ADAPTER_GET_DISABLED(Indirect)
+
+#undef ADAPTER_GET_DISABLED
+
 extern BOOLEAN
 AdapterIsTargetEmulated(
     IN  PXENVBD_ADAPTER Adapter,

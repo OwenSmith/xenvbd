@@ -49,6 +49,11 @@ DriverGetParametersKey(
     VOID
     );
 
+extern BOOLEAN
+DriverReadOverride(
+    IN  PCHAR   Name
+    );
+
 extern NTSTATUS
 DriverDispatchPnp(
     IN  PDEVICE_OBJECT  DeviceObject,
