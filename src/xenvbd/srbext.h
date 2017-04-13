@@ -38,6 +38,7 @@
 typedef struct _XENVBD_SRBEXT {
     PVOID                   OriginalReq;
     LIST_ENTRY              ListEntry;
+    LIST_ENTRY              RequestList;
     LONG                    RequestCount;
     // ScatterGather
     PVOID                   SGList;

@@ -1596,6 +1596,7 @@ AdapterHwBuildIo(
     RtlZeroMemory(SrbExt, sizeof(XENVBD_SRBEXT));
     SrbExt->OriginalReq = Srb;
     InitializeListHead(&SrbExt->ListEntry);
+    InitializeListHead(&SrbExt->RequestList);
 
     switch (Srb->Function) {
     case SRB_FUNCTION_EXECUTE_SCSI:

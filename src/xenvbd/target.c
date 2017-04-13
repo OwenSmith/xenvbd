@@ -113,7 +113,6 @@ struct _XENVBD_TARGET {
     PXENVBD_THREAD              BackendThread;
     PXENBUS_STORE_WATCH         BackendWatch;
 
-    LIST_ENTRY                  Fresh;
     LIST_ENTRY                  Prepared;
     LIST_ENTRY                  Submitted;
     LIST_ENTRY                  Shutdown;
@@ -400,13 +399,9 @@ TargetPrepareRW(
     PSCSI_REQUEST_BLOCK Srb = SrbExt->OriginalReq;
     ULONG64             SectorStart = Cdb_LogicalBlock(Srb);
     ULONG               SectorsLeft = Cdb_TransferBlock(Srb);
-    LIST_ENTRY          List;
-    KIRQL               Irql;
     const ULONG         SectorSize = Target->SectorSize;
     const ULONG         SectorMask = SectorSize - 1;
     const ULONG         SectorsPerPage = PAGE_SIZE / SectorSize;
-
-    InitializeListHead(&List);
 
     while (SectorsLeft > 0) {
         PXENVBD_REQUEST Request;
@@ -422,7 +417,7 @@ TargetPrepareRW(
         Request = TargetGetRequest(Target);
         if (Request == NULL) 
             goto fail1;
-        InsertTailList(&List, &Request->ListEntry);
+        InsertTailList(&SrbExt->RequestList, &Request->ListEntry);
         InterlockedIncrement(&SrbExt->RequestCount);
         
         Request->SrbExt     = SrbExt;
@@ -542,20 +537,6 @@ TargetPrepareRW(
     }
 
     Srb->SrbStatus = SRB_STATUS_PENDING;
-
-    KeAcquireSpinLock(&Target->QueueLock, &Irql);
-    for (;;) {
-        PLIST_ENTRY     ListEntry;
-        PXENVBD_REQUEST Request;
-
-        ListEntry = RemoveHeadList(&List);
-        if (ListEntry == &List)
-            break;
-        Request = CONTAINING_RECORD(ListEntry, XENVBD_REQUEST, ListEntry);
-        InsertTailList(&Target->Prepared, &Request->ListEntry);
-    }
-    KeReleaseSpinLock(&Target->QueueLock, Irql);
-
     return TRUE;
 
 fail6:
@@ -569,8 +550,8 @@ fail1:
         PLIST_ENTRY     ListEntry;
         PXENVBD_REQUEST Request;
 
-        ListEntry = RemoveHeadList(&List);
-        if (ListEntry == &List)
+        ListEntry = RemoveHeadList(&SrbExt->RequestList);
+        if (ListEntry == &SrbExt->RequestList)
             break;
         Request = CONTAINING_RECORD(ListEntry, XENVBD_REQUEST, ListEntry);
         TargetPutRequest(Target, Request);
@@ -579,7 +560,7 @@ fail1:
 }
 
 static BOOLEAN
-TargetPrepareUnmap(
+TargetPrepareDiscard(
     IN  PXENVBD_TARGET  Target,
     IN  PXENVBD_SRBEXT  SrbExt
     )
@@ -588,10 +569,7 @@ TargetPrepareUnmap(
     PUNMAP_LIST_HEADER  Unmap = Srb->DataBuffer;
 	ULONG               Count;
     ULONG               Index;
-    LIST_ENTRY          List;
-    KIRQL               Irql;
 
-    InitializeListHead(&List);
     Count = _byteswap_ushort(*(PUSHORT)Unmap->BlockDescrDataLength) / 
             sizeof(UNMAP_BLOCK_DESCRIPTOR);
 
@@ -602,7 +580,7 @@ TargetPrepareUnmap(
         Request = TargetGetRequest(Target);
         if (Request == NULL)
             goto fail1;
-        InsertTailList(&List, &Request->ListEntry);
+        InsertTailList(&SrbExt->RequestList, &Request->ListEntry);
         InterlockedIncrement(&SrbExt->RequestCount);
 
         Request->SrbExt         = SrbExt;
@@ -613,20 +591,6 @@ TargetPrepareUnmap(
     }
 
     Srb->SrbStatus = SRB_STATUS_PENDING;
-
-    KeAcquireSpinLock(&Target->QueueLock, &Irql);
-    for (;;) {
-        PLIST_ENTRY     ListEntry;
-        PXENVBD_REQUEST Request;
-
-        ListEntry = RemoveHeadList(&List);
-        if (ListEntry == &List)
-            break;
-        Request = CONTAINING_RECORD(ListEntry, XENVBD_REQUEST, ListEntry);
-        InsertTailList(&Target->Prepared, &Request->ListEntry);
-    }
-    KeReleaseSpinLock(&Target->QueueLock, Irql);
-
     return TRUE;
 
 fail1: 
@@ -635,8 +599,8 @@ fail1:
         PLIST_ENTRY     ListEntry;
         PXENVBD_REQUEST Request;
 
-        ListEntry = RemoveHeadList(&List);
-        if (ListEntry == &List)
+        ListEntry = RemoveHeadList(&SrbExt->RequestList);
+        if (ListEntry == &SrbExt->RequestList)
             break;
         Request = CONTAINING_RECORD(ListEntry, XENVBD_REQUEST, ListEntry);
         TargetPutRequest(Target, Request);
@@ -653,12 +617,12 @@ TargetPrepareSync(
 {
     PSCSI_REQUEST_BLOCK Srb = SrbExt->OriginalReq;
     PXENVBD_REQUEST     Request;
-    KIRQL               Irql;
 
     Srb->SrbStatus = SRB_STATUS_ERROR;
     Request = TargetGetRequest(Target);
     if (Request == NULL)
         return FALSE;
+    InsertTailList(&SrbExt->RequestList, &Request->ListEntry);
     InterlockedIncrement(&SrbExt->RequestCount);
 
     Request->SrbExt     = SrbExt;
@@ -666,116 +630,38 @@ TargetPrepareSync(
     Request->FirstSector = Cdb_LogicalBlock(Srb);
 
     Srb->SrbStatus = SRB_STATUS_PENDING;
-
-    KeAcquireSpinLock(&Target->QueueLock, &Irql);
-    InsertTailList(&Target->Prepared, &Request->ListEntry);
-    KeReleaseSpinLock(&Target->QueueLock, Irql);
-
     return TRUE;
 }
 
-static BOOLEAN
-TargetPrepareRequest(
-    IN  PXENVBD_TARGET  Target,
-    IN  PXENVBD_SRBEXT  SrbExt
-    )
-{
-    PSCSI_REQUEST_BLOCK Srb = SrbExt->OriginalReq;
-    UCHAR               Operation;
-
-    Operation = Cdb_OperationEx(Srb);
-    switch (Operation) {
-    case SCSIOP_READ:
-        return TargetPrepareRW(Target, SrbExt, BLKIF_OP_READ);
-
-    case SCSIOP_WRITE:
-        return TargetPrepareRW(Target, SrbExt, BLKIF_OP_WRITE);
-
-    case SCSIOP_UNMAP:
-        return TargetPrepareUnmap(Target, SrbExt);
-
-    case SCSIOP_SYNCHRONIZE_CACHE:
-        if (Target->FeatureFlush)
-            return TargetPrepareSync(Target, SrbExt, BLKIF_OP_FLUSH_DISKCACHE);
-        if (Target->FeatureBarrier)
-            return TargetPrepareSync(Target, SrbExt, BLKIF_OP_WRITE_BARRIER);
-        
-        // nothing supported - shouldnt really get here, but just complete if it did
-        Warning("[%u] FLUSH & BARRIER not supported, SCSIOP_SYNCHRONIZE_CACHE got to Prepare\n",
-                Target->TargetId);
-        Srb->SrbStatus = SRB_STATUS_SUCCESS;
-        AdapterCompleteSrb(Target->Adapter, SrbExt);
-        return TRUE;
-
-    default:
-        ASSERT(FALSE);
-        break;
-    }
-    return FALSE;
-}
-
-static FORCEINLINE BOOLEAN
-TargetPrepareFresh(
-    IN  PXENVBD_TARGET  Target
-    ) 
-{
-    PXENVBD_SRBEXT      SrbExt;
-    PLIST_ENTRY         ListEntry;
-    KIRQL               Irql;
-
-    KeAcquireSpinLock(&Target->QueueLock, &Irql);
-    ListEntry = RemoveHeadList(&Target->Fresh);
-    if (ListEntry == &Target->Fresh) {
-        KeReleaseSpinLock(&Target->QueueLock, Irql);
-        return FALSE;
-    }
-    KeReleaseSpinLock(&Target->QueueLock, Irql);
-
-    SrbExt = CONTAINING_RECORD(ListEntry, XENVBD_SRBEXT, ListEntry);
-
-    if (TargetPrepareRequest(Target, SrbExt))
-        return TRUE;
-
-    KeAcquireSpinLock(&Target->QueueLock, &Irql);
-    InsertHeadList(&Target->Fresh, ListEntry);
-    KeReleaseSpinLock(&Target->QueueLock, Irql);
-
-    return FALSE;
-}
-
-static FORCEINLINE BOOLEAN
+static FORCEINLINE VOID
 TargetSubmitPrepared(
     IN  PXENVBD_TARGET  Target
     )
 {
+    KIRQL           Irql;
+
+    KeAcquireSpinLock(&Target->QueueLock, &Irql);
     for (;;) {
         PLIST_ENTRY     ListEntry;
         PXENVBD_REQUEST Request;
-        KIRQL           Irql;
 
-        KeAcquireSpinLock(&Target->QueueLock, &Irql);
         ListEntry = RemoveHeadList(&Target->Prepared);
-        if (ListEntry == &Target->Prepared) {
-            KeReleaseSpinLock(&Target->QueueLock, Irql);
+        if (ListEntry == &Target->Prepared)
             break;
-        }
+
         Request = CONTAINING_RECORD(ListEntry, XENVBD_REQUEST, ListEntry);
 
         InsertTailList(&Target->Submitted, ListEntry);
-        KeReleaseSpinLock(&Target->QueueLock, Irql);
 
         if (BlockRingSubmit(Target->BlockRing, Request))
             continue;
 
-        KeAcquireSpinLock(&Target->QueueLock, &Irql);
         RemoveEntryList(&Request->ListEntry);
         InsertHeadList(&Target->Prepared, &Request->ListEntry);
-        KeReleaseSpinLock(&Target->QueueLock, Irql);
 
-        return FALSE;
+        break;
     }
-
-    return TRUE;
+    KeReleaseSpinLock(&Target->QueueLock, Irql);
 }
 
 static FORCEINLINE VOID
@@ -783,13 +669,12 @@ TargetCompleteShutdown(
     IN  PXENVBD_TARGET  Target
     )
 {
+    // Not using QueueLock here!
     if (IsListEmpty(&Target->Shutdown))
-        return;
-    if (!IsListEmpty(&Target->Fresh))
         return;
     if (!IsListEmpty(&Target->Prepared))
         return;
-    if (!IsListEmpty(&Target->Shutdown))
+    if (!IsListEmpty(&Target->Submitted))
         return;
 
     for (;;) {
@@ -818,21 +703,7 @@ TargetSubmitRequests(
     IN  PXENVBD_TARGET  Target
     )
 {
-    for (;;) {
-        // submit all prepared requests (0 or more requests)
-        // return TRUE if submitted 0 or more requests from prepared queue
-        // return FALSE iff ring is full
-        if (!TargetSubmitPrepared(Target))
-            break;
-
-        // prepare a single SRB (into 1 or more requests)
-        // return TRUE if prepare succeeded
-        // return FALSE if prepare failed or fresh queue empty
-        if (!TargetPrepareFresh(Target))
-            break;
-    }
-
-    // if no requests/SRBs outstanding, complete any shutdown SRBs
+    TargetSubmitPrepared(Target);
     TargetCompleteShutdown(Target);
 }
 
@@ -1004,7 +875,16 @@ TargetQueueSrb(
     Srb->SrbStatus = SRB_STATUS_PENDING;
 
     KeAcquireSpinLock(&Target->QueueLock, &Irql);
-    InsertTailList(&Target->Fresh, &SrbExt->ListEntry);
+    for (;;) {
+        PLIST_ENTRY     ListEntry;
+        PXENVBD_REQUEST Request;
+
+        ListEntry = RemoveHeadList(&SrbExt->RequestList);
+        if (ListEntry == &SrbExt->RequestList)
+            break;
+        Request = CONTAINING_RECORD(ListEntry, XENVBD_REQUEST, ListEntry);
+        InsertTailList(&Target->Prepared, &Request->ListEntry);
+    }
     KeReleaseSpinLock(&Target->QueueLock, Irql);
 
     BlockRingKick(Target->BlockRing);
@@ -1369,26 +1249,45 @@ TargetPrepareSrb(
     Operation = Cdb_OperationEx(Srb);
     switch (Operation) {
     case SCSIOP_READ:
+        Srb->SrbStatus = SRB_STATUS_PENDING;
+        if (TargetCheckSectors(Target, SrbExt)) {
+            TargetPrepareRW(Target, SrbExt, BLKIF_OP_READ);
+            break;
+        }
+        // Sectors out of range, fail SRB
+        Srb->SrbStatus = SRB_STATUS_ERROR;
+        break;
+
     case SCSIOP_WRITE:
         Srb->SrbStatus = SRB_STATUS_PENDING;
-        if (TargetCheckSectors(Target, SrbExt))
+        if (TargetCheckSectors(Target, SrbExt)) {
+            TargetPrepareRW(Target, SrbExt, BLKIF_OP_WRITE);
             break;
+        }
         // Sectors out of range, fail SRB
         Srb->SrbStatus = SRB_STATUS_ERROR;
         break;
 
     case SCSIOP_UNMAP:
         Srb->SrbStatus = SRB_STATUS_PENDING;
-        if (Target->FeatureDiscard)
+        if (Target->FeatureDiscard) {
+            TargetPrepareDiscard(Target, SrbExt);
             break;
+        }
         // Discard not supported, just succeed SRB
         Srb->SrbStatus = SRB_STATUS_SUCCESS;
         break;
 
     case SCSIOP_SYNCHRONIZE_CACHE:
         Srb->SrbStatus = SRB_STATUS_PENDING;
-        if (Target->FeatureBarrier || Target->FeatureFlush)
+        if (Target->FeatureFlush) {
+            TargetPrepareSync(Target, SrbExt, BLKIF_OP_FLUSH_DISKCACHE);
             break;
+        }
+        if (Target->FeatureBarrier) {
+            TargetPrepareSync(Target, SrbExt, BLKIF_OP_WRITE_BARRIER);
+            break;
+        }
         // Barrier and Flush not supported, just succeed SRB
         Srb->SrbStatus = SRB_STATUS_SUCCESS;
         break;
@@ -2407,24 +2306,20 @@ __TargetD0ToD3(
 
 static DECLSPEC_NOINLINE VOID
 TargetSuspendCallback(
-    IN  PVOID       Context
+    IN  PVOID           Context
     )
 {
-    PXENVBD_TARGET  Target = Context;
-    LIST_ENTRY      List;
-    NTSTATUS        status;
+    PXENVBD_TARGET      Target = Context;
+    PLIST_ENTRY         ListEntry;
+    PXENVBD_REQUEST     Request;
+    PXENVBD_SRBEXT      SrbExt;
+    PSCSI_REQUEST_BLOCK Srb;
+    NTSTATUS            status;
 
     // Any outstanding requests are going to cause problems...
     // Submitted requests are lost
     // Prepared requests will need re-preparing (different grant/backend)
-    // Fresh SRBs will be ok
-    InitializeListHead(&List);
     for (;;) {
-        PLIST_ENTRY         ListEntry;
-        PXENVBD_REQUEST     Request;
-        PXENVBD_SRBEXT      SrbExt;
-        PSCSI_REQUEST_BLOCK Srb;
-
         ListEntry = RemoveHeadList(&Target->Submitted);
         if (ListEntry == &Target->Submitted)
             break;
@@ -2439,29 +2334,18 @@ TargetSuspendCallback(
         }
     }
     for (;;) {
-        PLIST_ENTRY         ListEntry;
-        PXENVBD_REQUEST     Request;
-        PXENVBD_SRBEXT      SrbExt;
-
         ListEntry = RemoveHeadList(&Target->Prepared);
         if (ListEntry == &Target->Prepared)
             break;
         Request = CONTAINING_RECORD(ListEntry, XENVBD_REQUEST, ListEntry);
         SrbExt = Request->SrbExt;
+        Srb = SrbExt->OriginalReq;
 
         TargetPutRequest(Target, Request);
         if (InterlockedDecrement(&SrbExt->RequestCount) == 0) {
-            InsertHeadList(&List, &SrbExt->ListEntry);
+            Srb->SrbStatus = SRB_STATUS_ABORTED;
+            AdapterCompleteSrb(Target->Adapter, SrbExt);
         }
-    }
-    for (;;) {
-        PLIST_ENTRY     ListEntry;
-
-        ListEntry = RemoveHeadList(&List);
-        if (ListEntry == &List)
-            break;
-
-        InsertHeadList(&Target->Fresh, ListEntry);
     }
 
     __TargetD0ToD3(Target);
@@ -2943,7 +2827,6 @@ TargetCreate(
     if (!NT_SUCCESS(status))
         goto fail8;
 
-    InitializeListHead(&Target->Fresh);
     InitializeListHead(&Target->Prepared);
     InitializeListHead(&Target->Submitted);
     InitializeListHead(&Target->Shutdown);
@@ -2985,7 +2868,6 @@ fail9:
     ExDeleteNPagedLookasideList(&Target->SegmentList);
     ExDeleteNPagedLookasideList(&Target->IndirectList);
 
-    RtlZeroMemory(&Target->Fresh, sizeof(LIST_ENTRY));
     RtlZeroMemory(&Target->Prepared, sizeof(LIST_ENTRY));
     RtlZeroMemory(&Target->Submitted, sizeof(LIST_ENTRY));
     RtlZeroMemory(&Target->Shutdown, sizeof(LIST_ENTRY));
@@ -3042,7 +2924,6 @@ TargetDestroy(
     IN  PXENVBD_TARGET  Target
     )
 {
-    ASSERT(IsListEmpty(&Target->Fresh));
     ASSERT(IsListEmpty(&Target->Prepared));
     ASSERT(IsListEmpty(&Target->Submitted));
     ASSERT(IsListEmpty(&Target->Shutdown));
@@ -3051,7 +2932,6 @@ TargetDestroy(
     ExDeleteNPagedLookasideList(&Target->SegmentList);
     ExDeleteNPagedLookasideList(&Target->IndirectList);
 
-    RtlZeroMemory(&Target->Fresh, sizeof(LIST_ENTRY));
     RtlZeroMemory(&Target->Prepared, sizeof(LIST_ENTRY));
     RtlZeroMemory(&Target->Submitted, sizeof(LIST_ENTRY));
     RtlZeroMemory(&Target->Shutdown, sizeof(LIST_ENTRY));
