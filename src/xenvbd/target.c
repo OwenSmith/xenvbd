@@ -389,6 +389,24 @@ TargetPutRequest(
     ExFreeToNPagedLookasideList(&Target->RequestList, Request);
 }
 
+static FORCEINLINE VOID
+TargetCleanupSrbExt(
+    IN  PXENVBD_TARGET  Target,
+    IN  PXENVBD_SRBEXT  SrbExt
+    )
+{
+    for (;;) {
+        PLIST_ENTRY     ListEntry;
+        PXENVBD_REQUEST Request;
+
+        ListEntry = RemoveHeadList(&SrbExt->RequestList);
+        if (ListEntry == &SrbExt->RequestList)
+            break;
+        Request = CONTAINING_RECORD(ListEntry, XENVBD_REQUEST, ListEntry);
+        TargetPutRequest(Target, Request);
+    }
+}
+
 static BOOLEAN
 TargetPrepareRW(
     IN  PXENVBD_TARGET  Target,
@@ -546,16 +564,7 @@ fail3:
 fail2:
 fail1:
     Srb->SrbStatus = SRB_STATUS_ERROR;
-    for (;;) {
-        PLIST_ENTRY     ListEntry;
-        PXENVBD_REQUEST Request;
-
-        ListEntry = RemoveHeadList(&SrbExt->RequestList);
-        if (ListEntry == &SrbExt->RequestList)
-            break;
-        Request = CONTAINING_RECORD(ListEntry, XENVBD_REQUEST, ListEntry);
-        TargetPutRequest(Target, Request);
-    }
+    TargetCleanupSrbExt(Target, SrbExt);
     return FALSE;
 }
 
@@ -587,7 +596,7 @@ TargetPrepareDiscard(
         Request->Operation      = BLKIF_OP_DISCARD;
         Request->FirstSector    = _byteswap_uint64(*(PULONG64)Descr->StartingLba);
         Request->NrSectors      = _byteswap_ulong(*(PULONG)Descr->LbaCount);
-        Request->Flags          = 0;
+        Request->Flags          = Target->DiscardSecure ? BLKIF_DISCARD_SECURE : 0;
     }
 
     Srb->SrbStatus = SRB_STATUS_PENDING;
@@ -595,16 +604,7 @@ TargetPrepareDiscard(
 
 fail1: 
     Srb->SrbStatus = SRB_STATUS_ERROR;
-    for (;;) {
-        PLIST_ENTRY     ListEntry;
-        PXENVBD_REQUEST Request;
-
-        ListEntry = RemoveHeadList(&SrbExt->RequestList);
-        if (ListEntry == &SrbExt->RequestList)
-            break;
-        Request = CONTAINING_RECORD(ListEntry, XENVBD_REQUEST, ListEntry);
-        TargetPutRequest(Target, Request);
-    }
+    TargetCleanupSrbExt(Target, SrbExt);
     return FALSE;
 }
 
@@ -618,10 +618,10 @@ TargetPrepareSync(
     PSCSI_REQUEST_BLOCK Srb = SrbExt->OriginalReq;
     PXENVBD_REQUEST     Request;
 
-    Srb->SrbStatus = SRB_STATUS_ERROR;
     Request = TargetGetRequest(Target);
     if (Request == NULL)
-        return FALSE;
+        goto fail1;
+
     InsertTailList(&SrbExt->RequestList, &Request->ListEntry);
     InterlockedIncrement(&SrbExt->RequestCount);
 
@@ -631,6 +631,11 @@ TargetPrepareSync(
 
     Srb->SrbStatus = SRB_STATUS_PENDING;
     return TRUE;
+
+fail1:
+    Srb->SrbStatus = SRB_STATUS_ERROR;
+    TargetCleanupSrbExt(Target, SrbExt);
+    return FALSE;
 }
 
 static FORCEINLINE VOID
