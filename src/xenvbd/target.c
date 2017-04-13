@@ -992,19 +992,6 @@ TargetShutdown(
     BlockRingKick(Target->BlockRing);
 }
 
-VOID
-TargetPrepareSrb(
-    IN  PXENVBD_TARGET  Target,
-    IN  PXENVBD_SRBEXT  SrbExt
-    )
-{
-    PSCSI_REQUEST_BLOCK Srb = SrbExt->OriginalReq;
-
-    UNREFERENCED_PARAMETER(Target);
-
-    Srb->SrbStatus = SRB_STATUS_PENDING;
-}
-
 static FORCEINLINE VOID
 TargetQueueSrb(
     IN  PXENVBD_TARGET  Target,
@@ -1371,7 +1358,7 @@ TargetCheckSectors(
 }
 
 VOID
-TargetStartSrb(
+TargetPrepareSrb(
     IN  PXENVBD_TARGET  Target,
     IN  PXENVBD_SRBEXT  SrbExt
     )
@@ -1383,24 +1370,27 @@ TargetStartSrb(
     switch (Operation) {
     case SCSIOP_READ:
     case SCSIOP_WRITE:
-        if (!TargetCheckSectors(Target, SrbExt))
-            Srb->SrbStatus = SRB_STATUS_ERROR;
-        else
-            TargetQueueSrb(Target, SrbExt);
+        Srb->SrbStatus = SRB_STATUS_PENDING;
+        if (TargetCheckSectors(Target, SrbExt))
+            break;
+        // Sectors out of range, fail SRB
+        Srb->SrbStatus = SRB_STATUS_ERROR;
         break;
 
     case SCSIOP_UNMAP:
+        Srb->SrbStatus = SRB_STATUS_PENDING;
         if (Target->FeatureDiscard)
-            TargetQueueSrb(Target, SrbExt);
-        else
-            Srb->SrbStatus = SRB_STATUS_SUCCESS;
+            break;
+        // Discard not supported, just succeed SRB
+        Srb->SrbStatus = SRB_STATUS_SUCCESS;
         break;
 
     case SCSIOP_SYNCHRONIZE_CACHE:
+        Srb->SrbStatus = SRB_STATUS_PENDING;
         if (Target->FeatureBarrier || Target->FeatureFlush)
-            TargetQueueSrb(Target, SrbExt);
-        else
-            Srb->SrbStatus = SRB_STATUS_SUCCESS;
+            break;
+        // Barrier and Flush not supported, just succeed SRB
+        Srb->SrbStatus = SRB_STATUS_SUCCESS;
         break;
 
     case SCSIOP_INQUIRY:
@@ -1435,6 +1425,32 @@ TargetStartSrb(
         break;
 
     default:
+        Srb->SrbStatus = SRB_STATUS_INVALID_REQUEST;
+        break;
+    }
+}
+
+VOID
+TargetStartSrb(
+    IN  PXENVBD_TARGET  Target,
+    IN  PXENVBD_SRBEXT  SrbExt
+    )
+{
+    PSCSI_REQUEST_BLOCK Srb = SrbExt->OriginalReq;
+    UCHAR               Operation;
+
+    Operation = Cdb_OperationEx(Srb);
+    switch (Operation) {
+    case SCSIOP_READ:
+    case SCSIOP_WRITE:
+    case SCSIOP_UNMAP:
+    case SCSIOP_SYNCHRONIZE_CACHE:
+        ASSERT(Srb->SrbStatus == SRB_STATUS_PENDING);
+        TargetQueueSrb(Target, SrbExt);
+        break;
+
+    default:
+        // BuildIo should complete non-queue-worthy SRBs
         Srb->SrbStatus = SRB_STATUS_INVALID_REQUEST;
         break;
     }

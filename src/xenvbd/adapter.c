@@ -1638,33 +1638,38 @@ AdapterHwStartIo(
     PXENVBD_SRBEXT          SrbExt = Srb->SrbExtension;
     PXENVBD_TARGET          Target;
 
-    Srb->SrbStatus = SRB_STATUS_INVALID_TARGET_ID;
     Target = AdapterGetTarget(Adapter, Srb->TargetId);
-    if (Target) {
-        switch (Srb->Function) {
-        case SRB_FUNCTION_EXECUTE_SCSI:
-            TargetStartSrb(Target, SrbExt);
-            break;
-
-        case SRB_FUNCTION_RESET_DEVICE:
-            TargetReset(Target);
-            Srb->SrbStatus = SRB_STATUS_SUCCESS;
-            break;
-
-        case SRB_FUNCTION_FLUSH:
-            TargetFlush(Target, SrbExt);
-            break;
-
-        case SRB_FUNCTION_SHUTDOWN:
-            TargetShutdown(Target, SrbExt);
-            break;
-
-        default:
-            Srb->SrbStatus = SRB_STATUS_INVALID_REQUEST;
-            break;
-        }
+    ASSERT(Target != NULL);
+    if (Target == NULL) {
+        Srb->SrbStatus = SRB_STATUS_INVALID_TARGET_ID;
+        goto complete_srb;
     }
 
+    ASSERT(Srb->SrbStatus == SRB_STATUS_PENDING);
+    switch (Srb->Function) {
+    case SRB_FUNCTION_EXECUTE_SCSI:
+        TargetStartSrb(Target, SrbExt);
+        break;
+
+    case SRB_FUNCTION_RESET_DEVICE:
+        TargetReset(Target);
+        Srb->SrbStatus = SRB_STATUS_SUCCESS;
+        break;
+
+    case SRB_FUNCTION_FLUSH:
+        TargetFlush(Target, SrbExt);
+        break;
+
+    case SRB_FUNCTION_SHUTDOWN:
+        TargetShutdown(Target, SrbExt);
+        break;
+
+    default:
+        Srb->SrbStatus = SRB_STATUS_INVALID_REQUEST;
+        break;
+    }
+
+complete_srb:
     if (Srb->SrbStatus != SRB_STATUS_PENDING)
         AdapterCompleteSrb(Adapter, SrbExt);
 
