@@ -73,6 +73,7 @@ struct _XENVBD_ADAPTER {
     XENBUS_EVTCHN_INTERFACE     EvtchnInterface;
     XENBUS_STORE_INTERFACE      StoreInterface;
     XENBUS_GNTTAB_INTERFACE     GnttabInterface;
+    XENBUS_CACHE_INTERFACE      CacheInterface;
     XENBUS_DEBUG_INTERFACE      DebugInterface;
     XENBUS_SUSPEND_INTERFACE    SuspendInterface;
     XENBUS_UNPLUG_INTERFACE     UnplugInterface;
@@ -1258,69 +1259,80 @@ AdapterInitialize(
         goto fail3;
 
     status = AdapterQueryInterface(Adapter,
+                                   XENBUS_CACHE,
+                                   &Adapter->CacheInterface,
+                                   FALSE);
+    if (!NT_SUCCESS(status))
+        goto fail4;
+
+    status = AdapterQueryInterface(Adapter,
                                    XENBUS_SUSPEND,
                                    &Adapter->SuspendInterface,
                                    FALSE);
     if (!NT_SUCCESS(status))
-        goto fail4;
+        goto fail5;
 
     status = AdapterQueryInterface(Adapter,
                                    XENBUS_DEBUG,
                                    &Adapter->DebugInterface,
                                    FALSE);
     if (!NT_SUCCESS(status))
-        goto fail5;
+        goto fail6;
 
     status = AdapterQueryInterface(Adapter,
                                    XENBUS_UNPLUG,
                                    &Adapter->UnplugInterface,
                                    FALSE);
     if (!NT_SUCCESS(status))
-        goto fail6;
+        goto fail7;
 
     status = AdapterQueryInterface(Adapter,
                                    XENFILT_EMULATED,
                                    &Adapter->EmulatedInterface,
                                    TRUE);
     if (!NT_SUCCESS(status))
-        goto fail7;
+        goto fail8;
 
     status = ThreadCreate(AdapterScanThread,
                           Adapter,
                           &Adapter->ScanThread);
     if (!NT_SUCCESS(status))
-        goto fail8;
+        goto fail9;
 
     status = ThreadCreate(AdapterDevicePowerThread,
                           Adapter,
                           &Adapter->DevicePowerThread);
     if (!NT_SUCCESS(status))
-        goto fail9;
+        goto fail10;
 
     AdapterUnplugRequest(Adapter, TRUE);
     return STATUS_SUCCESS;
 
-fail9:
-    Error("fail9\n");
+fail10:
+    Error("fail10\n");
     ThreadAlert(Adapter->ScanThread);
     ThreadJoin(Adapter->ScanThread);
     Adapter->ScanThread = NULL;
-fail8:
-    Error("fail8\n");
+fail9:
+    Error("fail9\n");
     RtlZeroMemory(&Adapter->EmulatedInterface,
                   sizeof (XENFILT_EMULATED_INTERFACE));
-fail7:
-    Error("fail7\n");
+fail8:
+    Error("fail8\n");
     RtlZeroMemory(&Adapter->UnplugInterface,
                   sizeof (XENBUS_UNPLUG_INTERFACE));
-fail6:
-    Error("fail6\n");
+fail7:
+    Error("fail7\n");
     RtlZeroMemory(&Adapter->DebugInterface,
                   sizeof (XENBUS_DEBUG_INTERFACE));
-fail5:
-    Error("fail5\n");
+fail6:
+    Error("fail6\n");
     RtlZeroMemory(&Adapter->SuspendInterface,
                   sizeof (XENBUS_SUSPEND_INTERFACE));
+fail5:
+    Error("fail5\n");
+    RtlZeroMemory(&Adapter->CacheInterface,
+                  sizeof (XENBUS_CACHE_INTERFACE));
 fail4:
     Error("fail4\n");
     RtlZeroMemory(&Adapter->GnttabInterface,
@@ -1392,6 +1404,9 @@ AdapterTeardown(
 
     RtlZeroMemory(&Adapter->SuspendInterface,
                   sizeof (XENBUS_SUSPEND_INTERFACE));
+
+    RtlZeroMemory(&Adapter->CacheInterface,
+                  sizeof (XENBUS_CACHE_INTERFACE));
 
     RtlZeroMemory(&Adapter->GnttabInterface,
                   sizeof (XENBUS_GNTTAB_INTERFACE));
@@ -2089,6 +2104,7 @@ ADAPTER_GET_INTERFACE(Store, PXENBUS_STORE_INTERFACE)
 ADAPTER_GET_INTERFACE(Debug, PXENBUS_DEBUG_INTERFACE)
 ADAPTER_GET_INTERFACE(Evtchn, PXENBUS_EVTCHN_INTERFACE)
 ADAPTER_GET_INTERFACE(Gnttab, PXENBUS_GNTTAB_INTERFACE)
+ADAPTER_GET_INTERFACE(Cache, PXENBUS_CACHE_INTERFACE)
 ADAPTER_GET_INTERFACE(Suspend, PXENBUS_SUSPEND_INTERFACE)
 
 #undef ADAPTER_GET_INTERFACE
