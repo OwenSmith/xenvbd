@@ -78,6 +78,7 @@ struct _XENVBD_TARGET {
     XENVBD_STATE                State;
     KSPIN_LOCK                  StateLock;
     KSPIN_LOCK                  QueueLock;
+    KSPIN_LOCK                  CacheLock;
     BOOLEAN                     Missing;
     PXENVBD_GRANTER             Granter;
     PXENVBD_BLOCKRING           BlockRing;
@@ -106,6 +107,7 @@ struct _XENVBD_TARGET {
     XENBUS_DEBUG_INTERFACE      DebugInterface;
     XENBUS_SUSPEND_INTERFACE    SuspendInterface;
     XENBUS_STORE_INTERFACE      StoreInterface;
+    XENBUS_CACHE_INTERFACE      CacheInterface;
 
     PXENBUS_DEBUG_CALLBACK      DebugCallback;
     PXENBUS_SUSPEND_CALLBACK    SuspendCallback;
@@ -117,9 +119,9 @@ struct _XENVBD_TARGET {
     LIST_ENTRY                  Submitted;
     LIST_ENTRY                  Shutdown;
 
-    NPAGED_LOOKASIDE_LIST       RequestList;
-    NPAGED_LOOKASIDE_LIST       SegmentList;
-    NPAGED_LOOKASIDE_LIST       IndirectList;
+    PXENBUS_CACHE               RequestCache;
+    PXENBUS_CACHE               SegmentCache;
+    PXENBUS_CACHE               IndirectCache;
 };
 
 static FORCEINLINE PVOID
@@ -235,6 +237,108 @@ TargetSetMissing(
     Target->Missing = TRUE;
 }
 
+static VOID
+TargetAcquireLock(
+    IN  PVOID       Argument
+    )
+{
+    PXENVBD_TARGET  Target = Argument;
+
+    KeAcquireSpinLockAtDpcLevel(&Target->CacheLock);
+}
+
+static VOID
+TargetReleaseLock(
+    IN  PVOID       Argument
+    )
+{
+    PXENVBD_TARGET  Target = Argument;
+
+#pragma warning(suppress:26110)
+    KeReleaseSpinLockFromDpcLevel(&Target->CacheLock);
+}
+
+static NTSTATUS
+TargetRequestCtor(
+    IN  PVOID       Argument,
+    IN  PVOID       Object
+    )
+{
+    UNREFERENCED_PARAMETER(Argument);
+    UNREFERENCED_PARAMETER(Object);
+    return STATUS_SUCCESS;
+}
+
+static VOID
+TargetRequestDtor(
+    IN  PVOID       Argument,
+    IN  PVOID       Object
+    )
+{
+    UNREFERENCED_PARAMETER(Argument);
+    UNREFERENCED_PARAMETER(Object);
+}
+
+static NTSTATUS
+TargetSegmentCtor(
+    IN  PVOID       Argument,
+    IN  PVOID       Object
+    )
+{
+    UNREFERENCED_PARAMETER(Argument);
+    UNREFERENCED_PARAMETER(Object);
+    return STATUS_SUCCESS;
+}
+
+static VOID
+TargetSegmentDtor(
+    IN  PVOID       Argument,
+    IN  PVOID       Object
+    )
+{
+    UNREFERENCED_PARAMETER(Argument);
+    UNREFERENCED_PARAMETER(Object);
+}
+
+static NTSTATUS
+TargetIndirectCtor(
+    IN  PVOID           Argument,
+    IN  PVOID           Object
+    )
+{
+    PXENVBD_INDIRECT    Indirect = Object;
+    NTSTATUS            status;
+
+    UNREFERENCED_PARAMETER(Argument);
+
+    status = STATUS_NO_MEMORY;
+    Indirect->Mdl = __AllocatePage();
+    if (Indirect->Mdl == NULL)
+        goto fail1;
+
+    Indirect->Page = MmGetSystemAddressForMdlSafe(Indirect->Mdl,
+                                                  NormalPagePriority);
+    ASSERT(Indirect->Page != NULL);
+
+    return STATUS_SUCCESS;
+
+fail1:
+    return status;
+}
+
+static VOID
+TargetIndirectDtor(
+    IN  PVOID           Argument,
+    IN  PVOID           Object
+    )
+{
+    PXENVBD_INDIRECT    Indirect = Object;
+
+    UNREFERENCED_PARAMETER(Argument);
+
+    __FreePage(Indirect->Mdl);
+}
+
 static PXENVBD_INDIRECT
 TargetGetIndirect(
     IN  PXENVBD_TARGET  Target
@@ -243,35 +347,30 @@ TargetGetIndirect(
     PXENVBD_INDIRECT    Indirect;
     NTSTATUS            status;
 
-    Indirect = ExAllocateFromNPagedLookasideList(&Target->IndirectList);
+    Indirect = XENBUS_CACHE(Get,
+                            &Target->CacheInterface,
+                            Target->IndirectCache,
+                            FALSE);
     if (Indirect == NULL)
         goto fail1;
 
-    RtlZeroMemory(Indirect, sizeof(XENVBD_INDIRECT));
-
     InitializeListHead(&Indirect->ListEntry);
-    Indirect->Mdl = __AllocatePage();
-    if (Indirect->Mdl == NULL)
-        goto fail2;
-
-    Indirect->Page = MmGetSystemAddressForMdlSafe(Indirect->Mdl,
-                                                  NormalPagePriority);
-    ASSERT(Indirect->Page != NULL);
 
     status = GranterGet(Target->Granter,
                         MmGetMdlPfnArray(Indirect->Mdl)[0],
                         TRUE,
                         &Indirect->Grant);
     if (!NT_SUCCESS(status))
-        goto fail3;
+        goto fail2;
 
     return Indirect;
 
-fail3:
-    __FreePage(Indirect->Mdl);
 fail2:
-    RtlZeroMemory(Indirect, sizeof(XENVBD_INDIRECT));
-    ExFreeToNPagedLookasideList(&Target->IndirectList, Indirect);
+    XENBUS_CACHE(Put,
+                 &Target->CacheInterface,
+                 Target->IndirectCache,
+                 Indirect,
+                 FALSE);
 fail1:
     return NULL;
 }
@@ -284,12 +383,13 @@ TargetPutIndirect(
 {
     if (Indirect->Grant)
         GranterPut(Target->Granter, Indirect->Grant);
+    Indirect->Grant = NULL;
 
-    if (Indirect->Page)
-        __FreePage(Indirect->Mdl);
-
-    RtlZeroMemory(Indirect, sizeof(XENVBD_INDIRECT));
-    ExFreeToNPagedLookasideList(&Target->IndirectList, Indirect);
+    XENBUS_CACHE(Put,
+                 &Target->CacheInterface,
+                 Target->IndirectCache,
+                 Indirect,
+                 FALSE);
 }
 
 static PXENVBD_SEGMENT
@@ -299,12 +399,14 @@ TargetGetSegment(
 {
     PXENVBD_SEGMENT     Segment;
 
-    Segment = ExAllocateFromNPagedLookasideList(&Target->SegmentList);
+    Segment = XENBUS_CACHE(Get,
+                           &Target->CacheInterface,
+                           Target->SegmentCache,
+                           FALSE);
     if (Segment == NULL)
         goto fail1;
 
     RtlZeroMemory(Segment, sizeof(XENVBD_SEGMENT));
-
     InitializeListHead(&Segment->ListEntry);
 
     return Segment;
@@ -329,7 +431,11 @@ TargetPutSegment(
         BufferPut(Segment->BufferId);
 
     RtlZeroMemory(Segment, sizeof(XENVBD_SEGMENT));
-    ExFreeToNPagedLookasideList(&Target->SegmentList, Segment);
+    XENBUS_CACHE(Put,
+                 &Target->CacheInterface,
+                 Target->SegmentCache,
+                 Segment,
+                 FALSE);
 }
 
 static PXENVBD_REQUEST
@@ -339,7 +445,10 @@ TargetGetRequest(
 {
     PXENVBD_REQUEST     Request;
 
-    Request = ExAllocateFromNPagedLookasideList(&Target->RequestList);
+    Request = XENBUS_CACHE(Get,
+                           &Target->CacheInterface,
+                           Target->RequestCache,
+                           FALSE);
     if (Request == NULL)
         goto fail1;
 
@@ -386,7 +495,11 @@ TargetPutRequest(
     }
 
     RtlZeroMemory(Request, sizeof(XENVBD_REQUEST));
-    ExFreeToNPagedLookasideList(&Target->RequestList, Request);
+    XENBUS_CACHE(Put,
+                 &Target->CacheInterface,
+                 Target->RequestCache,
+                 Request,
+                 FALSE);
 }
 
 static FORCEINLINE VOID
@@ -2761,6 +2874,7 @@ TargetCreate(
     ULONG               DeviceId;
     ULONG               TargetId;
     ULONG               Size;
+    CHAR                Name[sizeof("vbd_XXXX_req")];
     NTSTATUS            status;
 
     DeviceId = strtoul(Device->Buffer, NULL, 10);
@@ -2787,8 +2901,10 @@ TargetCreate(
     Target->BackendId       = DOMID_INVALID;
     KeInitializeSpinLock(&Target->StateLock);
     KeInitializeSpinLock(&Target->QueueLock);
+    KeInitializeSpinLock(&Target->CacheLock);
 
     AdapterGetDebugInterface(Adapter, &Target->DebugInterface);
+    AdapterGetCacheInterface(Adapter, &Target->CacheInterface);
     AdapterGetStoreInterface(Adapter, &Target->StoreInterface);
     AdapterGetSuspendInterface(Adapter, &Target->SuspendInterface);
 
@@ -2836,42 +2952,120 @@ TargetCreate(
     InitializeListHead(&Target->Submitted);
     InitializeListHead(&Target->Shutdown);
 
-    ExInitializeNPagedLookasideList(&Target->RequestList,
-                                    NULL,
-                                    NULL,
-                                    0,
-                                    sizeof(XENVBD_REQUEST),
-                                    REQUEST_POOL_TAG,
-                                    0);
-    ExInitializeNPagedLookasideList(&Target->SegmentList,
-                                    NULL,
-                                    NULL,
-                                    0,
-                                    sizeof(XENVBD_SEGMENT),
-                                    SEGMENT_POOL_TAG,
-                                    0);
-    ExInitializeNPagedLookasideList(&Target->IndirectList,
-                                    NULL,
-                                    NULL,
-                                    0,
-                                    sizeof(XENVBD_INDIRECT),
-                                    INDIRECT_POOL_TAG,
-                                    0);
+    status = XENBUS_CACHE(Acquire,
+                          &Target->CacheInterface);
+    if (!NT_SUCCESS(status))
+        goto fail9;
+
+    status = RtlStringCbPrintfA(Name,
+                                sizeof(Name),
+                                "vbd_%u_req",
+                                Target->TargetId);
+    if (!NT_SUCCESS(status))
+        goto fail10;
+
+    status = XENBUS_CACHE(Create,
+                          &Target->CacheInterface,
+                          Name,
+                          sizeof(XENVBD_REQUEST),
+                          8,
+                          TargetRequestCtor,
+                          TargetRequestDtor,
+                          TargetAcquireLock,
+                          TargetReleaseLock,
+                          Target,
+                          &Target->RequestCache);
+    if (!NT_SUCCESS(status))
+        goto fail11;
+
+    status = RtlStringCbPrintfA(Name,
+                                sizeof(Name),
+                                "vbd_%u_seg",
+                                Target->TargetId);
+    if (!NT_SUCCESS(status))
+        goto fail12;
+
+    status = XENBUS_CACHE(Create,
+                          &Target->CacheInterface,
+                          Name,
+                          sizeof(XENVBD_SEGMENT),
+                          32,
+                          TargetSegmentCtor,
+                          TargetSegmentDtor,
+                          TargetAcquireLock,
+                          TargetReleaseLock,
+                          Target,
+                          &Target->SegmentCache);
+    if (!NT_SUCCESS(status))
+        goto fail13;
+
+    status = RtlStringCbPrintfA(Name,
+                                sizeof(Name),
+                                "vbd_%u_ind",
+                                Target->TargetId);
+    if (!NT_SUCCESS(status))
+        goto fail14;
+
+    status = XENBUS_CACHE(Create,
+                          &Target->CacheInterface,
+                          Name,
+                          sizeof(XENVBD_INDIRECT),
+                          0,
+                          TargetIndirectCtor,
+                          TargetIndirectDtor,
+                          TargetAcquireLock,
+                          TargetReleaseLock,
+                          Target,
+                          &Target->IndirectCache);
+    if (!NT_SUCCESS(status))
+        goto fail15;
 
     status = TargetD3ToD0(Target);
     if (!NT_SUCCESS(status))
-        goto fail9;
+        goto fail16;
 
     Verbose("[%u] <=====\n", TargetId);
     *_Target = Target;
     return STATUS_SUCCESS;
 
+fail16:
+    Error("fail16\n");
+
+    XENBUS_CACHE(Destroy,
+                 &Target->CacheInterface,
+                 Target->IndirectCache);
+    Target->IndirectCache = NULL;
+
+fail15:
+    Error("fail15\n");
+fail14:
+    Error("fail14\n");
+
+    XENBUS_CACHE(Destroy,
+                 &Target->CacheInterface,
+                 Target->SegmentCache);
+    Target->SegmentCache = NULL;
+
+fail13:
+    Error("fail13\n");
+fail12:
+    Error("fail12\n");
+
+    XENBUS_CACHE(Destroy,
+                 &Target->CacheInterface,
+                 Target->RequestCache);
+    Target->RequestCache = NULL;
+    
+fail11:
+    Error("fail11\n");
+fail10:
+    Error("fail10\n");
+
+    XENBUS_CACHE(Release,
+                 &Target->CacheInterface);
+
 fail9:
     Error("fail9\n");
-
-    ExDeleteNPagedLookasideList(&Target->RequestList);
-    ExDeleteNPagedLookasideList(&Target->SegmentList);
-    ExDeleteNPagedLookasideList(&Target->IndirectList);
 
     RtlZeroMemory(&Target->Prepared, sizeof(LIST_ENTRY));
     RtlZeroMemory(&Target->Submitted, sizeof(LIST_ENTRY));
@@ -2903,6 +3097,7 @@ fail3:
 fail2:
     Error("fail2\n");
     RtlZeroMemory(&Target->DebugInterface, sizeof(XENBUS_DEBUG_INTERFACE));
+    RtlZeroMemory(&Target->CacheInterface, sizeof(XENBUS_CACHE_INTERFACE));
     RtlZeroMemory(&Target->StoreInterface, sizeof(XENBUS_STORE_INTERFACE));
     RtlZeroMemory(&Target->SuspendInterface, sizeof(XENBUS_SUSPEND_INTERFACE));
 
@@ -2914,6 +3109,7 @@ fail2:
     Target->TargetId        = 0;
     Target->State           = 0;
     Target->BackendId       = 0;
+    RtlZeroMemory(&Target->CacheLock, sizeof(KSPIN_LOCK));
     RtlZeroMemory(&Target->QueueLock, sizeof(KSPIN_LOCK));
     RtlZeroMemory(&Target->StateLock, sizeof(KSPIN_LOCK));
 
@@ -2933,9 +3129,23 @@ TargetDestroy(
     ASSERT(IsListEmpty(&Target->Submitted));
     ASSERT(IsListEmpty(&Target->Shutdown));
 
-    ExDeleteNPagedLookasideList(&Target->RequestList);
-    ExDeleteNPagedLookasideList(&Target->SegmentList);
-    ExDeleteNPagedLookasideList(&Target->IndirectList);
+    XENBUS_CACHE(Destroy,
+                 &Target->CacheInterface,
+                 Target->IndirectCache);
+    Target->IndirectCache = NULL;
+
+    XENBUS_CACHE(Destroy,
+                 &Target->CacheInterface,
+                 Target->SegmentCache);
+    Target->SegmentCache = NULL;
+
+    XENBUS_CACHE(Destroy,
+                 &Target->CacheInterface,
+                 Target->RequestCache);
+    Target->RequestCache = NULL;
+
+    XENBUS_CACHE(Release,
+                 &Target->CacheInterface);
 
     RtlZeroMemory(&Target->Prepared, sizeof(LIST_ENTRY));
     RtlZeroMemory(&Target->Submitted, sizeof(LIST_ENTRY));
@@ -2962,6 +3172,7 @@ TargetDestroy(
 
     RtlZeroMemory(&Target->DebugInterface, sizeof(XENBUS_DEBUG_INTERFACE));
     RtlZeroMemory(&Target->StoreInterface, sizeof(XENBUS_STORE_INTERFACE));
+    RtlZeroMemory(&Target->CacheInterface, sizeof(XENBUS_CACHE_INTERFACE));
     RtlZeroMemory(&Target->SuspendInterface, sizeof(XENBUS_SUSPEND_INTERFACE));
 
     Target->Adapter         = NULL;
@@ -2972,6 +3183,7 @@ TargetDestroy(
     Target->TargetId        = 0;
     Target->State           = 0;
     Target->BackendId       = 0;
+    RtlZeroMemory(&Target->CacheLock, sizeof(KSPIN_LOCK));
     RtlZeroMemory(&Target->QueueLock, sizeof(KSPIN_LOCK));
     RtlZeroMemory(&Target->StateLock, sizeof(KSPIN_LOCK));
 
