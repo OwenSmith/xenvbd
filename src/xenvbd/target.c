@@ -649,7 +649,7 @@ TargetPrepareRW(
         }
 
         // build indirects
-        if (MaxSegments > BLKIF_MAX_SEGMENTS_PER_REQUEST) {
+        if (Request->NrSegments > BLKIF_MAX_SEGMENTS_PER_REQUEST) {
             // round up
             ULONG   NumInd = (Request->NrSegments + XENVBD_MAX_SEGMENTS_PER_PAGE - 1) /
                               XENVBD_MAX_SEGMENTS_PER_PAGE;
@@ -663,6 +663,8 @@ TargetPrepareRW(
                     goto fail6;
 
                 InsertTailList(&Request->Indirects, &Indirect->ListEntry);
+
+                // TODO: Fill Indirect->Page with Segment info?
             }
         }
     }
@@ -756,9 +758,6 @@ TargetSubmitPrepared(
     IN  PXENVBD_TARGET  Target
     )
 {
-    KIRQL           Irql;
-
-    KeAcquireSpinLock(&Target->QueueLock, &Irql);
     for (;;) {
         PLIST_ENTRY     ListEntry;
         PXENVBD_REQUEST Request;
@@ -779,7 +778,6 @@ TargetSubmitPrepared(
 
         break;
     }
-    KeReleaseSpinLock(&Target->QueueLock, Irql);
 }
 
 static FORCEINLINE VOID
@@ -787,7 +785,6 @@ TargetCompleteShutdown(
     IN  PXENVBD_TARGET  Target
     )
 {
-    // Not using QueueLock here!
     if (IsListEmpty(&Target->Shutdown))
         return;
     if (!IsListEmpty(&Target->Prepared))
@@ -799,15 +796,10 @@ TargetCompleteShutdown(
         PLIST_ENTRY         ListEntry;
         PXENVBD_SRBEXT      SrbExt;
         PSCSI_REQUEST_BLOCK Srb;
-        KIRQL               Irql;
 
-        KeAcquireSpinLock(&Target->QueueLock, &Irql);
         ListEntry = RemoveHeadList(&Target->Shutdown);
-        if (ListEntry == &Target->Shutdown) {
-            KeReleaseSpinLock(&Target->QueueLock, Irql);
+        if (ListEntry == &Target->Shutdown)
             break;
-        }
-        KeReleaseSpinLock(&Target->QueueLock, Irql);
 
         SrbExt = CONTAINING_RECORD(ListEntry, XENVBD_SRBEXT, ListEntry);
         Srb = SrbExt->OriginalReq;
@@ -821,8 +813,13 @@ TargetSubmitRequests(
     IN  PXENVBD_TARGET  Target
     )
 {
+    // Always called from BlockRingPoll (with BlockRing:Lock held)
+    ASSERT3U(KeGetCurrentIrql(), ==, DISPATCH_LEVEL); 
+
+    KeAcquireSpinLockAtDpcLevel(&Target->QueueLock);
     TargetSubmitPrepared(Target);
     TargetCompleteShutdown(Target);
+    KeReleaseSpinLockFromDpcLevel(&Target->QueueLock);
 }
 
 static FORCEINLINE VOID
@@ -857,12 +854,14 @@ TargetCompleteResponse(
     PXENVBD_REQUEST     Request;
     PXENVBD_SRBEXT      SrbExt;
     PSCSI_REQUEST_BLOCK Srb;
-    KIRQL               Irql;
+
+    // Always called from BlockRingPoll (with BlockRing:Lock held)
+    ASSERT3U(KeGetCurrentIrql(), ==, DISPATCH_LEVEL);
 
     if (Id == 0)
         return FALSE;
 
-    KeAcquireSpinLock(&Target->QueueLock, &Irql);
+    KeAcquireSpinLockAtDpcLevel(&Target->QueueLock);
     Request = NULL;
     for (ListEntry = Target->Submitted.Flink;
          ListEntry != &Target->Submitted;
@@ -878,7 +877,7 @@ TargetCompleteResponse(
 
         Request = NULL;
     }
-    KeReleaseSpinLock(&Target->QueueLock, Irql);
+    KeReleaseSpinLockFromDpcLevel(&Target->QueueLock);
 
     if (Request == NULL)
         return FALSE;
@@ -932,15 +931,10 @@ TargetReset(
     IN  PXENVBD_TARGET  Target
     )
 {
-    ULONG               Outstanding;
-
     Verbose("[%u] =====>\n", Target->TargetId);
 
     ASSERT3U(KeGetCurrentIrql(), ==, DISPATCH_LEVEL);
-
-    Trace("polling...\n");
-    Outstanding = BlockRingPoll(Target->BlockRing);
-    Trace("%u requests outstanding\n", Outstanding);
+    // cant do much... maybe poll the ring?
 
     Verbose("[%u] <=====\n", Target->TargetId);
 }
@@ -1478,6 +1472,9 @@ TargetStoreReadDiskInfo(
     IN  PXENVBD_TARGET  Target
     )
 {
+    BOOLEAN             Changed = FALSE;
+    ULONG               Value;
+    ULONG64             Value64;
     PCHAR               Buffer;
     NTSTATUS            status;
 
@@ -1488,7 +1485,10 @@ TargetStoreReadDiskInfo(
                           "info",
                           &Buffer);
     if (NT_SUCCESS(status)) {
-        Target->DiskInfo = strtoul(Buffer, NULL, 10);
+        Value = strtoul(Buffer, NULL, 10);
+        if (Target->DiskInfo != Value)
+            Changed = TRUE;
+        Target->DiskInfo = Value;
 
         XENBUS_STORE(Free,
                      &Target->StoreInterface,
@@ -1502,7 +1502,10 @@ TargetStoreReadDiskInfo(
                           "sectors",
                           &Buffer);
     if (NT_SUCCESS(status)) {
-        Target->SectorCount = _strtoui64(Buffer, NULL, 10);
+        Value64 = _strtoui64(Buffer, NULL, 10);
+        if (Target->SectorCount != Value64)
+            Changed = TRUE;
+        Target->SectorCount = Value64;
 
         XENBUS_STORE(Free,
                      &Target->StoreInterface,
@@ -1516,7 +1519,10 @@ TargetStoreReadDiskInfo(
                           "sector-size",
                           &Buffer);
     if (NT_SUCCESS(status)) {
-        Target->SectorSize = strtoul(Buffer, NULL, 10);
+        Value = strtoul(Buffer, NULL, 10);
+        if (Target->SectorSize != Value)
+            Changed = TRUE;
+        Target->SectorSize = Value;
 
         XENBUS_STORE(Free,
                      &Target->StoreInterface,
@@ -1530,7 +1536,10 @@ TargetStoreReadDiskInfo(
                           "physical-sector-size",
                           &Buffer);
     if (NT_SUCCESS(status)) {
-        Target->PhysicalSectorSize = strtoul(Buffer, NULL, 10);
+        Value = strtoul(Buffer, NULL, 10);
+        if (Target->PhysicalSectorSize != Value)
+            Changed = TRUE;
+        Target->PhysicalSectorSize = Value;
 
         XENBUS_STORE(Free,
                      &Target->StoreInterface,
@@ -1538,6 +1547,16 @@ TargetStoreReadDiskInfo(
     } else {
         Target->PhysicalSectorSize = Target->SectorSize;
     }
+
+    if (!Changed)
+        return;
+
+    Verbose("[%u] %llu sectors of %u (%u) (%08x)\n",
+            Target->TargetId,
+            Target->SectorCount,
+            Target->SectorSize,
+            Target->PhysicalSectorSize,
+            Target->DiskInfo);
 }
 
 static VOID
@@ -1686,11 +1705,36 @@ TargetStoreReadFeatures(
         if (NT_SUCCESS(status)) {
             Target->FeatureIndirect = strtoul(Buffer, NULL, 10);
 
+            if (Target->FeatureIndirect > XENVBD_MAX_SEGMENTS_PER_INDIRECT)
+                Target->FeatureIndirect = XENVBD_MAX_SEGMENTS_PER_INDIRECT;
+            if (Target->FeatureIndirect < BLKIF_MAX_SEGMENTS_PER_REQUEST)
+                Target->FeatureIndirect = 0;
+
             XENBUS_STORE(Free,
                          &Target->StoreInterface,
                          Buffer);
         }
     }
+
+    Verbose("[%u] features:%s%s%s%s%s\n",
+            Target->TargetId,
+            Target->Removable ? " REMOVABLE" : "",
+            Target->FeatureBarrier ? " BARRIER" : "",
+            Target->FeatureFlush ? " FLUSH" : "",
+            Target->FeatureDiscard ? " DISCARD" : "",
+            Target->FeatureIndirect ? " INDIRECT" : "");
+
+    if (Target->FeatureDiscard)
+        Verbose("[%u] discard: %s%u @ %u\n",
+                Target->TargetId,
+                Target->DiscardSecure ? "SECURE " : "",
+                Target->DiscardGranularity,
+                Target->DiscardAlignment);
+
+    if (Target->FeatureIndirect)
+        Verbose("[%u] indirect: %u\n",
+                Target->TargetId,
+                Target->FeatureIndirect);
 }
 
 static NTSTATUS

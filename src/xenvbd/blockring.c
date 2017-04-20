@@ -566,6 +566,8 @@ BlockRingPoll(
     IN  PXENVBD_BLOCKRING   BlockRing
     )
 {
+    ULONG                   Outstanding;
+
     ASSERT3U(KeGetCurrentIrql(), ==, DISPATCH_LEVEL);
     KeAcquireSpinLockAtDpcLevel(&BlockRing->Lock);
 
@@ -614,12 +616,14 @@ BlockRingPoll(
     }
 
 done:
-    KeReleaseSpinLockFromDpcLevel(&BlockRing->Lock);
 
     // submit all prepared requests, prepare the next srb
     TargetSubmitRequests(BlockRing->Target);
 
-    return BlockRing->Submitted - BlockRing->Completed;
+    Outstanding = BlockRing->Submitted - BlockRing->Completed;
+    KeReleaseSpinLockFromDpcLevel(&BlockRing->Lock);
+
+    return Outstanding;
 }
 
 BOOLEAN
@@ -631,15 +635,14 @@ BlockRingSubmit(
     PLIST_ENTRY             ListEntry;
     ULONG                   Index;
     PXENVBD_GRANTER         Granter;
-    KIRQL                   Irql;
     blkif_request_t*        req;
     BOOLEAN                 Notify;
 
-    KeAcquireSpinLock(&BlockRing->Lock, &Irql);
-    if (RING_FULL(&BlockRing->Front)) {
-        KeReleaseSpinLock(&BlockRing->Lock, Irql);
+    // Always called from BlockRing DPC (with BlockRing:Lock held, and Target:QueueLock held)
+    ASSERT3U(KeGetCurrentIrql(), ==, DISPATCH_LEVEL); 
+
+    if (RING_FULL(&BlockRing->Front))
         return FALSE;
-    }
 
     req = RING_GET_REQUEST(&BlockRing->Front, BlockRing->Front.req_prod_pvt);
     ++BlockRing->Front.req_prod_pvt;
@@ -681,9 +684,9 @@ BlockRingSubmit(
             for (PageIdx = 0; PageIdx < BLKIF_MAX_INDIRECT_PAGES_PER_REQUEST; ++PageIdx) {
                 PXENVBD_INDIRECT Page;
 
-                if (PageEntry != &Request->Indirects)
+                if (PageEntry == &Request->Indirects)
                     break;
-                if (SegEntry != &Request->Segments)
+                if (SegEntry == &Request->Segments)
                     break;
 
                 Page = CONTAINING_RECORD(PageEntry, XENVBD_INDIRECT, ListEntry);
@@ -692,7 +695,7 @@ BlockRingSubmit(
                 for (SegIdx = 0; SegIdx < XENVBD_MAX_SEGMENTS_PER_PAGE; ++SegIdx) {
                     PXENVBD_SEGMENT Segment;
 
-                    if (SegEntry != &Request->Segments)
+                    if (SegEntry == &Request->Segments)
                         break;
 
                     Segment = CONTAINING_RECORD(SegEntry, XENVBD_SEGMENT, ListEntry);
@@ -735,7 +738,6 @@ BlockRingSubmit(
     KeMemoryBarrier();
 
     RING_PUSH_REQUESTS_AND_CHECK_NOTIFY(&BlockRing->Front, Notify);
-    KeReleaseSpinLock(&BlockRing->Lock, Irql);
 
     if (Notify) {
         XENBUS_EVTCHN(Send,
