@@ -76,11 +76,6 @@ BlockRingDisconnect(
     IN  PXENVBD_BLOCKRING   BlockRing
     );
 
-extern ULONG
-BlockRingPoll(
-    IN  PXENVBD_BLOCKRING   BlockRing
-    );
-
 extern BOOLEAN
 BlockRingSubmit(
     IN  PXENVBD_BLOCKRING   BlockRing,

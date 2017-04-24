@@ -107,6 +107,66 @@ __BlockRingFree(
         ExFreePoolWithTag(Buffer, BLOCKRING_POOL_TAG);
 }
 
+static VOID
+BlockRingPoll(
+    IN  PXENVBD_BLOCKRING   BlockRing
+    )
+{
+    ASSERT3U(KeGetCurrentIrql(), ==, DISPATCH_LEVEL);
+    KeAcquireSpinLockAtDpcLevel(&BlockRing->Lock);
+
+    // Guard against this locked region being called after the
+    // lock on FrontendSetState
+    if (BlockRing->Enabled == FALSE)
+        goto done;
+
+    for (;;) {
+        ULONG   rsp_prod;
+        ULONG   rsp_cons;
+
+        KeMemoryBarrier();
+
+        rsp_prod = BlockRing->Shared->rsp_prod;
+        rsp_cons = BlockRing->Front.rsp_cons;
+
+        KeMemoryBarrier();
+
+        if (rsp_cons == rsp_prod)
+            break;
+
+        while (rsp_cons != rsp_prod) {
+            blkif_response_t*   rsp;
+
+            rsp = RING_GET_RESPONSE(&BlockRing->Front, rsp_cons);
+            ++rsp_cons;
+
+            if (!TargetCompleteResponse(BlockRing->Target,
+                                        rsp->id,
+                                        rsp->status)) {
+                XENBUS_DEBUG(Trigger,
+                             &BlockRing->DebugInterface,
+                             BlockRing->DebugCallback);
+            }
+            ++BlockRing->Completed;
+
+            // zero entire ring slot (to detect further failures)
+            RtlZeroMemory(rsp, sizeof(union blkif_sring_entry));
+        }
+
+        KeMemoryBarrier();
+
+        BlockRing->Front.rsp_cons = rsp_cons;
+        BlockRing->Shared->rsp_event = rsp_cons + 1;
+    }
+
+done:
+
+    // submit all prepared requests, prepare the next srb
+    TargetSubmitRequests(BlockRing->Target);
+
+    KeReleaseSpinLockFromDpcLevel(&BlockRing->Lock);
+}
+
 KSERVICE_ROUTINE BlockRingInterrupt;
 
 BOOLEAN
@@ -146,7 +206,7 @@ BlockRingDpc(
 
     ASSERT(BlockRing != NULL);
 
-    (VOID) BlockRingPoll(BlockRing);
+    BlockRingPoll(BlockRing);
 
     XENBUS_EVTCHN(Unmask,
                   &BlockRing->EvtchnInterface,
@@ -559,71 +619,6 @@ BlockRingDisconnect(
     RtlZeroMemory(&BlockRing->StoreInterface, sizeof(XENBUS_STORE_INTERFACE));
 
     BlockRing->Connected = FALSE;
-}
-
-ULONG
-BlockRingPoll(
-    IN  PXENVBD_BLOCKRING   BlockRing
-    )
-{
-    ULONG                   Outstanding;
-
-    ASSERT3U(KeGetCurrentIrql(), ==, DISPATCH_LEVEL);
-    KeAcquireSpinLockAtDpcLevel(&BlockRing->Lock);
-
-    // Guard against this locked region being called after the 
-    // lock on FrontendSetState
-    if (BlockRing->Enabled == FALSE)
-        goto done;
-
-    for (;;) {
-        ULONG   rsp_prod;
-        ULONG   rsp_cons;
-
-        KeMemoryBarrier();
-
-        rsp_prod = BlockRing->Shared->rsp_prod;
-        rsp_cons = BlockRing->Front.rsp_cons;
-
-        KeMemoryBarrier();
-
-        if (rsp_cons == rsp_prod)
-            break;
-
-        while (rsp_cons != rsp_prod) {
-            blkif_response_t*   rsp;
-
-            rsp = RING_GET_RESPONSE(&BlockRing->Front, rsp_cons);
-            ++rsp_cons;
-
-            if (!TargetCompleteResponse(BlockRing->Target,
-                                        rsp->id,
-                                        rsp->status)) {
-                XENBUS_DEBUG(Trigger,
-                             &BlockRing->DebugInterface,
-                             BlockRing->DebugCallback);
-            }
-            ++BlockRing->Completed;
-
-            // zero entire ring slot (to detect further failures)
-            RtlZeroMemory(rsp, sizeof(union blkif_sring_entry));
-        }
-
-        KeMemoryBarrier();
-
-        BlockRing->Front.rsp_cons = rsp_cons;
-        BlockRing->Shared->rsp_event = rsp_cons + 1;
-    }
-
-done:
-
-    // submit all prepared requests, prepare the next srb
-    TargetSubmitRequests(BlockRing->Target);
-
-    Outstanding = BlockRing->Submitted - BlockRing->Completed;
-    KeReleaseSpinLockFromDpcLevel(&BlockRing->Lock);
-
-    return Outstanding;
 }
 
 BOOLEAN
