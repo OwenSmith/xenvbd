@@ -138,15 +138,15 @@ TargetStartSrb(
     );
 
 extern VOID
-TargetSubmitRequests(
-    IN  PXENVBD_TARGET  Target
+TargetCompleteRequest(
+    IN  PXENVBD_TARGET  Target,
+    IN  PXENVBD_REQUEST Request,
+    IN  SHORT           Status
     );
 
-extern BOOLEAN
-TargetCompleteResponse(
-    IN  PXENVBD_TARGET  Target,
-    IN  ULONG64         Id,
-    IN  SHORT           Status
+extern VOID
+TargetCompleteShutdown(
+    IN  PXENVBD_TARGET  Target
     );
 
 #endif // _XENVBD_TARGET_H

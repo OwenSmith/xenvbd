@@ -63,6 +63,9 @@ struct _XENVBD_BLOCKRING {
 
     PXENBUS_DEBUG_CALLBACK  DebugCallback;
 
+    LIST_ENTRY              Prepared;
+    LIST_ENTRY              Submitted;
+
     KSPIN_LOCK              Lock;
     PMDL                    Mdl;
     blkif_sring_t*          Shared;
@@ -73,10 +76,10 @@ struct _XENVBD_BLOCKRING {
     PXENBUS_EVTCHN_CHANNEL  Channel;
     KDPC                    Dpc;
 
-    ULONG                   Submitted;
-    ULONG                   Completed;
-    ULONG                   Interrupts;
-    ULONG                   Dpcs;
+    ULONG                   NrSubmitted;
+    ULONG                   NrCompleted;
+    ULONG                   NrInterrupts;
+    ULONG                   NrDpcs;
 };
 
 #define BLOCKRING_POOL_TAG  'gnRX'
@@ -107,6 +110,205 @@ __BlockRingFree(
         ExFreePoolWithTag(Buffer, BLOCKRING_POOL_TAG);
 }
 
+static FORCEINLINE VOID
+BlockRingInsertDirect(
+    IN  PXENVBD_BLOCKRING   BlockRing,
+    IN  PXENVBD_REQUEST     Request,
+    IN  blkif_request_t*    req
+    )
+{
+    PLIST_ENTRY             ListEntry;
+    ULONG                   Index;
+    PXENVBD_GRANTER         Granter;
+
+    Granter = TargetGetGranter(BlockRing->Target);
+
+    req->operation      = Request->Operation;
+    req->nr_segments    = (UCHAR)Request->NrSegments;
+    req->handle         = (USHORT)TargetGetDeviceId(BlockRing->Target);
+    req->id             = Request->Id;
+    req->sector_number  = Request->FirstSector;
+
+    for (ListEntry = Request->Segments.Flink, Index = 0;
+            ListEntry != &Request->Segments && Index < BLKIF_MAX_SEGMENTS_PER_REQUEST;
+            ListEntry = ListEntry->Flink, ++Index) {
+        PXENVBD_SEGMENT Segment = CONTAINING_RECORD(ListEntry, XENVBD_SEGMENT, ListEntry);
+        ULONG           Grant;
+
+        Grant = GranterReference(Granter, Segment->Grant);
+
+        req->seg[Index].first_sect = Segment->FirstSector;
+        req->seg[Index].last_sect  = Segment->LastSector;
+        req->seg[Index].gref       = Grant;
+    }
+}
+
+static FORCEINLINE VOID
+BlockRingInsertIndirect(
+    IN  PXENVBD_BLOCKRING           BlockRing,
+    IN  PXENVBD_REQUEST             Request,
+    IN  blkif_request_indirect_t*   req
+    )
+{
+    ULONG                           PageIdx;
+    ULONG                           SegIdx;
+    PLIST_ENTRY                     PageEntry;
+    PLIST_ENTRY                     SegEntry;
+    PXENVBD_GRANTER                 Granter;
+
+    Granter = TargetGetGranter(BlockRing->Target);
+
+    req->operation      = BLKIF_OP_INDIRECT;
+    req->indirect_op    = Request->Operation;
+    req->nr_segments    = Request->NrSegments;
+    req->id             = Request->Id;
+    req->sector_number  = Request->FirstSector;
+    req->handle         = (USHORT)TargetGetDeviceId(BlockRing->Target);
+
+    PageEntry = Request->Indirects.Flink;
+    SegEntry = Request->Segments.Flink;
+    for (PageIdx = 0; PageIdx < BLKIF_MAX_INDIRECT_PAGES_PER_REQUEST; ++PageIdx) {
+        PXENVBD_INDIRECT Page;
+
+        if (PageEntry == &Request->Indirects)
+            break;
+        if (SegEntry == &Request->Segments)
+            break;
+
+        Page = CONTAINING_RECORD(PageEntry, XENVBD_INDIRECT, ListEntry);
+        req->indirect_grefs[PageIdx] = GranterReference(Granter, Page->Grant);
+
+        for (SegIdx = 0; SegIdx < XENVBD_MAX_SEGMENTS_PER_PAGE; ++SegIdx) {
+            PXENVBD_SEGMENT Segment;
+
+            if (SegEntry == &Request->Segments)
+                break;
+
+            Segment = CONTAINING_RECORD(SegEntry, XENVBD_SEGMENT, ListEntry);
+            Page->Page[SegIdx].GrantRef = GranterReference(Granter, Segment->Grant);
+            Page->Page[SegIdx].First    = Segment->FirstSector;
+            Page->Page[SegIdx].Last     = Segment->LastSector;
+
+            SegEntry = SegEntry->Flink;
+        }
+
+        PageEntry = PageEntry->Flink;
+    }
+}
+
+static FORCEINLINE VOID
+BlockRingInsertDiscard(
+    IN  PXENVBD_BLOCKRING           BlockRing,
+    IN  PXENVBD_REQUEST             Request,
+    IN  blkif_request_discard_t*    req
+    )
+{
+    req->operation      = BLKIF_OP_DISCARD;
+    req->flag           = Request->Flags;
+    req->handle         = (USHORT)TargetGetDeviceId(BlockRing->Target);
+    req->id             = Request->Id;
+    req->sector_number  = Request->FirstSector;
+    req->nr_sectors     = Request->NrSectors;
+}
+
+static FORCEINLINE VOID
+BlockRingInsert(
+    IN  PXENVBD_BLOCKRING   BlockRing,
+    IN  PXENVBD_REQUEST     Request,
+    IN  blkif_request_t*    req
+    )
+{
+    switch (Request->Operation) {
+    case BLKIF_OP_DISCARD:
+        BlockRingInsertDiscard(BlockRing,
+                               Request,
+                               (blkif_request_discard_t*)req);
+        break;
+
+    case BLKIF_OP_READ:
+    case BLKIF_OP_WRITE:
+        if (Request->NrSegments > BLKIF_MAX_SEGMENTS_PER_REQUEST)
+            BlockRingInsertIndirect(BlockRing,
+                                    Request,
+                                    (blkif_request_indirect_t*)req);
+        else
+            BlockRingInsertDirect(BlockRing,
+                                  Request,
+                                  req);
+        break;
+
+    case BLKIF_OP_WRITE_BARRIER:
+    case BLKIF_OP_FLUSH_DISKCACHE:
+    default:
+        BlockRingInsertDirect(BlockRing,
+                              Request,
+                              req);
+        break;
+    }
+}
+
+static FORCEINLINE BOOLEAN
+BlockRingPostRequest(
+    IN  PXENVBD_BLOCKRING   BlockRing,
+    IN  PXENVBD_REQUEST     Request
+    )
+{
+    blkif_request_t*        req;
+    BOOLEAN                 Notify;
+
+    // Always called from BlockRing DPC (with BlockRing:Lock held, and Target:QueueLock held)
+    ASSERT3U(KeGetCurrentIrql(), ==, DISPATCH_LEVEL); 
+
+    if (RING_FULL(&BlockRing->Front))
+        return FALSE;
+
+    req = RING_GET_REQUEST(&BlockRing->Front, BlockRing->Front.req_prod_pvt);
+    ++BlockRing->Front.req_prod_pvt;
+    ++BlockRing->NrSubmitted;
+    InsertTailList(&BlockRing->Submitted, &Request->ListEntry);
+
+    BlockRingInsert(BlockRing, Request, req);
+
+    KeMemoryBarrier();
+
+    RING_PUSH_REQUESTS_AND_CHECK_NOTIFY(&BlockRing->Front, Notify);
+
+    if (Notify) {
+        XENBUS_EVTCHN(Send,
+                      &BlockRing->EvtchnInterface,
+                      BlockRing->Channel);
+    }
+
+    return TRUE;
+}
+
+static FORCEINLINE PXENVBD_REQUEST
+BlockRingGetSubmitted(
+    IN  PXENVBD_BLOCKRING   BlockRing,
+    IN  ULONG64             Id
+    )
+{
+    PLIST_ENTRY             ListEntry;
+
+    for (ListEntry = BlockRing->Submitted.Flink;
+         ListEntry != &BlockRing->Submitted;
+         ListEntry = ListEntry->Flink) {
+        PXENVBD_REQUEST     Request;
+
+        Request = CONTAINING_RECORD(ListEntry, XENVBD_REQUEST, ListEntry);
+        if (Request->Id != Id)
+            continue;
+
+        ASSERT3P(Request, ==, (PVOID)(ULONG_PTR)Request->Id);
+        ASSERT3U(Request->Id, ==, Id);
+
+        RemoveEntryList(&Request->ListEntry);
+        return Request;
+    }
+
+    return NULL;
+}
+
 static VOID
 BlockRingPoll(
     IN  PXENVBD_BLOCKRING   BlockRing
@@ -135,19 +337,23 @@ BlockRingPoll(
             break;
 
         while (rsp_cons != rsp_prod) {
+            PXENVBD_REQUEST     Request;
             blkif_response_t*   rsp;
 
             rsp = RING_GET_RESPONSE(&BlockRing->Front, rsp_cons);
             ++rsp_cons;
 
-            if (!TargetCompleteResponse(BlockRing->Target,
-                                        rsp->id,
-                                        rsp->status)) {
+            Request = BlockRingGetSubmitted(BlockRing, rsp->id);
+            if (Request == NULL) {
                 XENBUS_DEBUG(Trigger,
                              &BlockRing->DebugInterface,
                              BlockRing->DebugCallback);
+            } else {
+                TargetCompleteRequest(BlockRing->Target,
+                                      Request,
+                                      rsp->status);
             }
-            ++BlockRing->Completed;
+            ++BlockRing->NrCompleted;
 
             // zero entire ring slot (to detect further failures)
             RtlZeroMemory(rsp, sizeof(union blkif_sring_entry));
@@ -159,10 +365,27 @@ BlockRingPoll(
         BlockRing->Shared->rsp_event = rsp_cons + 1;
     }
 
-done:
-
     // submit all prepared requests, prepare the next srb
-    TargetSubmitRequests(BlockRing->Target);
+    for (;;) {
+        PLIST_ENTRY     ListEntry;
+        PXENVBD_REQUEST Request;
+
+        ListEntry = RemoveHeadList(&BlockRing->Prepared);
+        if (ListEntry == &BlockRing->Prepared)
+            break;
+        Request = CONTAINING_RECORD(ListEntry, XENVBD_REQUEST, ListEntry);
+
+        if (BlockRingPostRequest(BlockRing, Request))
+            continue;
+
+        InsertHeadList(&BlockRing->Prepared, ListEntry);
+        break;
+    }
+
+done:
+    if (IsListEmpty(&BlockRing->Prepared) &&
+        IsListEmpty(&BlockRing->Submitted))
+        TargetCompleteShutdown(BlockRing->Target);
 
     KeReleaseSpinLockFromDpcLevel(&BlockRing->Lock);
 }
@@ -181,9 +404,9 @@ BlockRingInterrupt(
 
     ASSERT(BlockRing != NULL);
 
-	++BlockRing->Interrupts;
+	++BlockRing->NrInterrupts;
 	if (KeInsertQueueDpc(&BlockRing->Dpc, NULL, NULL))
-		++BlockRing->Dpcs;
+	    ++BlockRing->NrDpcs;
 
     return TRUE;
 }
@@ -265,8 +488,8 @@ BlockRingDebugCallback(
     XENBUS_DEBUG(Printf,
                  &BlockRing->DebugInterface,
                  "Submitted: %u, Completed: %u\n",
-                 BlockRing->Submitted,
-                 BlockRing->Completed);
+                 BlockRing->NrSubmitted,
+                 BlockRing->NrCompleted);
 
     Port = XENBUS_EVTCHN(GetPort,
                          &BlockRing->EvtchnInterface,
@@ -281,11 +504,11 @@ BlockRingDebugCallback(
     XENBUS_DEBUG(Printf,
                  &BlockRing->DebugInterface,
                  "Interrupts: %u, DPCs: %u\n",
-                 BlockRing->Interrupts,
-                 BlockRing->Dpcs);
+                 BlockRing->NrInterrupts,
+                 BlockRing->NrDpcs);
 
-    BlockRing->Interrupts = 0;
-    BlockRing->Dpcs = 0;
+    BlockRing->NrInterrupts = 0;
+    BlockRing->NrDpcs = 0;
 }
 
 NTSTATUS
@@ -301,6 +524,8 @@ BlockRingCreate(
     (*BlockRing)->Target = Target;
     KeInitializeSpinLock(&(*BlockRing)->Lock);
     KeInitializeDpc(&(*BlockRing)->Dpc, BlockRingDpc, *BlockRing);
+    InitializeListHead(&(*BlockRing)->Prepared);
+    InitializeListHead(&(*BlockRing)->Submitted);
 
     return STATUS_SUCCESS;
 
@@ -316,7 +541,9 @@ BlockRingDestroy(
     BlockRing->Target = NULL;
     RtlZeroMemory(&BlockRing->Lock, sizeof(KSPIN_LOCK));
     RtlZeroMemory(&BlockRing->Dpc, sizeof(KDPC));
-    
+    RtlZeroMemory(&BlockRing->Prepared, sizeof(LIST_ENTRY));
+    RtlZeroMemory(&BlockRing->Submitted, sizeof(LIST_ENTRY));
+
     ASSERT(IsZeroMemory(BlockRing, sizeof(XENVBD_BLOCKRING)));
     
     __BlockRingFree(BlockRing);
@@ -618,129 +845,69 @@ BlockRingDisconnect(
     XENBUS_STORE(Release, &BlockRing->StoreInterface);
     RtlZeroMemory(&BlockRing->StoreInterface, sizeof(XENBUS_STORE_INTERFACE));
 
+    BlockRing->NrSubmitted = 0;
+    BlockRing->NrCompleted = 0;
+    BlockRing->NrInterrupts = 0;
+    BlockRing->NrDpcs = 0;
+
     BlockRing->Connected = FALSE;
 }
 
-BOOLEAN
+VOID
 BlockRingSubmit(
     IN  PXENVBD_BLOCKRING   BlockRing,
-    IN  PXENVBD_REQUEST     Request
+    IN  PLIST_ENTRY         RequestList
     )
 {
-    PLIST_ENTRY             ListEntry;
-    ULONG                   Index;
-    PXENVBD_GRANTER         Granter;
-    blkif_request_t*        req;
-    BOOLEAN                 Notify;
+    KIRQL                   Irql;
+    PLIST_ENTRY             ListItem;
 
-    // Always called from BlockRing DPC (with BlockRing:Lock held, and Target:QueueLock held)
-    ASSERT3U(KeGetCurrentIrql(), ==, DISPATCH_LEVEL); 
+    KeAcquireSpinLock(&BlockRing->Lock, &Irql);
 
-    if (RING_FULL(&BlockRing->Front))
-        return FALSE;
+    ListItem = RequestList->Flink;
 
-    req = RING_GET_REQUEST(&BlockRing->Front, BlockRing->Front.req_prod_pvt);
-    ++BlockRing->Front.req_prod_pvt;
-    ++BlockRing->Submitted;
-
-    Granter = TargetGetGranter(BlockRing->Target);
-    switch (Request->Operation) {
-    case BLKIF_OP_DISCARD: {
-        blkif_request_discard_t*        req_d;
-        req_d = (blkif_request_discard_t*)req;
-        req_d->operation        = BLKIF_OP_DISCARD;
-        req_d->flag             = Request->Flags;
-        req_d->handle           = (USHORT)TargetGetDeviceId(BlockRing->Target);
-        req_d->id               = Request->Id;
-        req_d->sector_number    = Request->FirstSector;
-        req_d->nr_sectors       = Request->NrSectors;
-        } break;
-
-    case BLKIF_OP_READ:
-    case BLKIF_OP_WRITE:
-        if (Request->NrSegments > BLKIF_MAX_SEGMENTS_PER_REQUEST) {
-            // Indirect
-            blkif_request_indirect_t*   req_i;
-            ULONG                       PageIdx;
-            ULONG                       SegIdx;
-            PLIST_ENTRY                 PageEntry;
-            PLIST_ENTRY                 SegEntry;
-
-            req_i = (blkif_request_indirect_t*)req;
-            req_i->operation         = BLKIF_OP_INDIRECT;
-            req_i->indirect_op       = Request->Operation;
-            req_i->nr_segments       = Request->NrSegments;
-            req_i->id                = Request->Id;
-            req_i->sector_number     = Request->FirstSector;
-            req_i->handle            = (USHORT)TargetGetDeviceId(BlockRing->Target);
-
-            PageEntry = Request->Indirects.Flink;
-            SegEntry = Request->Segments.Flink;
-            for (PageIdx = 0; PageIdx < BLKIF_MAX_INDIRECT_PAGES_PER_REQUEST; ++PageIdx) {
-                PXENVBD_INDIRECT Page;
-
-                if (PageEntry == &Request->Indirects)
-                    break;
-                if (SegEntry == &Request->Segments)
-                    break;
-
-                Page = CONTAINING_RECORD(PageEntry, XENVBD_INDIRECT, ListEntry);
-                req_i->indirect_grefs[PageIdx] = GranterReference(Granter, Page->Grant);
-
-                for (SegIdx = 0; SegIdx < XENVBD_MAX_SEGMENTS_PER_PAGE; ++SegIdx) {
-                    PXENVBD_SEGMENT Segment;
-
-                    if (SegEntry == &Request->Segments)
-                        break;
-
-                    Segment = CONTAINING_RECORD(SegEntry, XENVBD_SEGMENT, ListEntry);
-                    Page->Page[SegIdx].GrantRef = GranterReference(Granter, Segment->Grant);
-                    Page->Page[SegIdx].First    = Segment->FirstSector;
-                    Page->Page[SegIdx].Last     = Segment->LastSector;
-
-                    SegEntry = SegEntry->Flink;
-                }
-
-                PageEntry = PageEntry->Flink;
-            }
-            break; // out of switch
-        }
-        // intentional fall through
-    case BLKIF_OP_WRITE_BARRIER:
-    case BLKIF_OP_FLUSH_DISKCACHE:
-    default:
-        req->operation      = Request->Operation;
-        req->nr_segments    = (UCHAR)Request->NrSegments;
-        req->handle         = (USHORT)TargetGetDeviceId(BlockRing->Target);
-        req->id             = Request->Id;
-        req->sector_number  = Request->FirstSector;
-
-        for (ListEntry = Request->Segments.Flink, Index = 0;
-             ListEntry != &Request->Segments && Index < BLKIF_MAX_SEGMENTS_PER_REQUEST;
-             ListEntry = ListEntry->Flink, ++Index) {
-            PXENVBD_SEGMENT Segment = CONTAINING_RECORD(ListEntry, XENVBD_SEGMENT, ListEntry);
-            ULONG           Grant;
-
-            Grant = GranterReference(Granter, Segment->Grant);
-
-            req->seg[Index].first_sect = Segment->FirstSector;
-            req->seg[Index].last_sect  = Segment->LastSector;
-            req->seg[Index].gref       = Grant;
-        }
-        break;
+    if (!IsListEmpty(RequestList)) {
+        RemoveEntryList(RequestList);
+        InitializeListHead(RequestList);
+        AppendTailList(&BlockRing->Prepared, ListItem);
     }
 
-    KeMemoryBarrier();
+    KeReleaseSpinLock(&BlockRing->Lock, Irql);
 
-    RING_PUSH_REQUESTS_AND_CHECK_NOTIFY(&BlockRing->Front, Notify);
+    BlockRingKick(BlockRing);
+}
 
-    if (Notify) {
-        XENBUS_EVTCHN(Send,
-                      &BlockRing->EvtchnInterface,
-                      BlockRing->Channel);
+VOID
+BlockRingSuspendCallback(
+    IN  PXENVBD_BLOCKRING   BlockRing
+    )
+{
+    for (;;) {
+        PLIST_ENTRY         ListEntry;
+        PXENVBD_REQUEST     Request;
+
+        ListEntry = RemoveHeadList(&BlockRing->Submitted);
+        if (ListEntry == &BlockRing->Submitted)
+            break;
+        Request = CONTAINING_RECORD(ListEntry, XENVBD_REQUEST, ListEntry);
+
+        TargetCompleteRequest(BlockRing->Target,
+                              Request,
+                              BLKIF_RSP_ERROR);
     }
+    for (;;) {
+        PLIST_ENTRY         ListEntry;
+        PXENVBD_REQUEST     Request;
 
-    return TRUE;
+        ListEntry = RemoveHeadList(&BlockRing->Prepared);
+        if (ListEntry == &BlockRing->Prepared)
+            break;
+        Request = CONTAINING_RECORD(ListEntry, XENVBD_REQUEST, ListEntry);
+
+        TargetCompleteRequest(BlockRing->Target,
+                              Request,
+                              BLKIF_RSP_ERROR);
+    }
 }
 
 VOID

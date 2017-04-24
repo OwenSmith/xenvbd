@@ -115,8 +115,6 @@ struct _XENVBD_TARGET {
     PXENVBD_THREAD              BackendThread;
     PXENBUS_STORE_WATCH         BackendWatch;
 
-    LIST_ENTRY                  Prepared;
-    LIST_ENTRY                  Submitted;
     LIST_ENTRY                  Shutdown;
 
     PXENBUS_CACHE               RequestCache;
@@ -754,75 +752,6 @@ fail1:
 }
 
 static FORCEINLINE VOID
-TargetSubmitPrepared(
-    IN  PXENVBD_TARGET  Target
-    )
-{
-    for (;;) {
-        PLIST_ENTRY     ListEntry;
-        PXENVBD_REQUEST Request;
-
-        ListEntry = RemoveHeadList(&Target->Prepared);
-        if (ListEntry == &Target->Prepared)
-            break;
-
-        Request = CONTAINING_RECORD(ListEntry, XENVBD_REQUEST, ListEntry);
-
-        InsertTailList(&Target->Submitted, ListEntry);
-
-        if (BlockRingSubmit(Target->BlockRing, Request))
-            continue;
-
-        RemoveEntryList(&Request->ListEntry);
-        InsertHeadList(&Target->Prepared, &Request->ListEntry);
-
-        break;
-    }
-}
-
-static FORCEINLINE VOID
-TargetCompleteShutdown(
-    IN  PXENVBD_TARGET  Target
-    )
-{
-    if (IsListEmpty(&Target->Shutdown))
-        return;
-    if (!IsListEmpty(&Target->Prepared))
-        return;
-    if (!IsListEmpty(&Target->Submitted))
-        return;
-
-    for (;;) {
-        PLIST_ENTRY         ListEntry;
-        PXENVBD_SRBEXT      SrbExt;
-        PSCSI_REQUEST_BLOCK Srb;
-
-        ListEntry = RemoveHeadList(&Target->Shutdown);
-        if (ListEntry == &Target->Shutdown)
-            break;
-
-        SrbExt = CONTAINING_RECORD(ListEntry, XENVBD_SRBEXT, ListEntry);
-        Srb = SrbExt->OriginalReq;
-        Srb->SrbStatus = SRB_STATUS_SUCCESS;
-        AdapterCompleteSrb(TargetGetAdapter(Target), SrbExt);
-    }
-}
-
-VOID
-TargetSubmitRequests(
-    IN  PXENVBD_TARGET  Target
-    )
-{
-    // Always called from BlockRingPoll (with BlockRing:Lock held)
-    ASSERT3U(KeGetCurrentIrql(), ==, DISPATCH_LEVEL); 
-
-    KeAcquireSpinLockAtDpcLevel(&Target->QueueLock);
-    TargetSubmitPrepared(Target);
-    TargetCompleteShutdown(Target);
-    KeReleaseSpinLockFromDpcLevel(&Target->QueueLock);
-}
-
-static FORCEINLINE VOID
 TargetDisableFeature(
     IN  PXENVBD_TARGET  Target,
     IN  UCHAR           Operation
@@ -843,44 +772,19 @@ TargetDisableFeature(
     }
 }
 
-BOOLEAN
-TargetCompleteResponse(
+VOID
+TargetCompleteRequest(
     IN  PXENVBD_TARGET  Target,
-    IN  ULONG64         Id,
+    IN  PXENVBD_REQUEST Request,
     IN  SHORT           Status
     )
 {
     PLIST_ENTRY         ListEntry;
-    PXENVBD_REQUEST     Request;
     PXENVBD_SRBEXT      SrbExt;
     PSCSI_REQUEST_BLOCK Srb;
 
     // Always called from BlockRingPoll (with BlockRing:Lock held)
     ASSERT3U(KeGetCurrentIrql(), ==, DISPATCH_LEVEL);
-
-    if (Id == 0)
-        return FALSE;
-
-    KeAcquireSpinLockAtDpcLevel(&Target->QueueLock);
-    Request = NULL;
-    for (ListEntry = Target->Submitted.Flink;
-         ListEntry != &Target->Submitted;
-         ListEntry = ListEntry->Flink) {
-        Request = CONTAINING_RECORD(ListEntry, XENVBD_REQUEST, ListEntry);
-
-        if (Request->Id == Id) {
-            RemoveEntryList(&Request->ListEntry);
-
-            ASSERT3P(Request, ==, (PVOID)(ULONG_PTR)Id);
-            break;
-        }
-
-        Request = NULL;
-    }
-    KeReleaseSpinLockFromDpcLevel(&Target->QueueLock);
-
-    if (Request == NULL)
-        return FALSE;
 
     SrbExt = Request->SrbExt;
     ASSERT3P(SrbExt, !=, NULL);
@@ -917,13 +821,34 @@ TargetCompleteResponse(
     TargetPutRequest(Target, Request);
 
     if (InterlockedDecrement(&SrbExt->RequestCount) != 0)
-        return TRUE;
+        return;
 
     if (Srb->SrbStatus == SRB_STATUS_PENDING)
         Srb->SrbStatus = SRB_STATUS_SUCCESS;
 
     AdapterCompleteSrb(Target->Adapter, SrbExt);
-    return TRUE;
+}
+
+VOID
+TargetCompleteShutdown(
+    IN  PXENVBD_TARGET  Target
+    )
+{
+    for (;;) {
+        PLIST_ENTRY         ListEntry;
+        PXENVBD_SRBEXT      SrbExt;
+        PSCSI_REQUEST_BLOCK Srb;
+
+        ListEntry = ExInterlockedRemoveHeadList(&Target->Shutdown,
+                                                &Target->QueueLock);
+        if (ListEntry == NULL)
+            break;
+
+        SrbExt = CONTAINING_RECORD(ListEntry, XENVBD_SRBEXT, ListEntry);
+        Srb = SrbExt->OriginalReq;
+        Srb->SrbStatus = SRB_STATUS_SUCCESS;
+        AdapterCompleteSrb(TargetGetAdapter(Target), SrbExt);
+    }
 }
 
 VOID
@@ -935,6 +860,7 @@ TargetReset(
 
     ASSERT3U(KeGetCurrentIrql(), ==, DISPATCH_LEVEL);
     // cant do much... maybe poll the ring?
+    BlockRingKick(Target->BlockRing);
 
     Verbose("[%u] <=====\n", Target->TargetId);
 }
@@ -946,13 +872,12 @@ TargetFlush(
     )
 {
     PSCSI_REQUEST_BLOCK Srb = SrbExt->OriginalReq;
-    KIRQL               Irql;
 
     Srb->SrbStatus = SRB_STATUS_PENDING;
 
-    KeAcquireSpinLock(&Target->QueueLock, &Irql);
-    InsertTailList(&Target->Shutdown, &SrbExt->ListEntry);
-    KeReleaseSpinLock(&Target->QueueLock, Irql);
+    ExInterlockedInsertTailList(&Target->Shutdown,
+                                &SrbExt->ListEntry,
+                                &Target->QueueLock);
 
     BlockRingKick(Target->BlockRing);
 }
@@ -964,13 +889,12 @@ TargetShutdown(
     )
 {
     PSCSI_REQUEST_BLOCK Srb = SrbExt->OriginalReq;
-    KIRQL               Irql;
 
     Srb->SrbStatus = SRB_STATUS_PENDING;
 
-    KeAcquireSpinLock(&Target->QueueLock, &Irql);
-    InsertTailList(&Target->Shutdown, &SrbExt->ListEntry);
-    KeReleaseSpinLock(&Target->QueueLock, Irql);
+    ExInterlockedInsertTailList(&Target->Shutdown,
+                                &SrbExt->ListEntry,
+                                &Target->QueueLock);
 
     BlockRingKick(Target->BlockRing);
 }
@@ -982,24 +906,9 @@ TargetQueueSrb(
     )
 {
     PSCSI_REQUEST_BLOCK Srb = SrbExt->OriginalReq;
-    KIRQL               Irql;
 
     Srb->SrbStatus = SRB_STATUS_PENDING;
-
-    KeAcquireSpinLock(&Target->QueueLock, &Irql);
-    for (;;) {
-        PLIST_ENTRY     ListEntry;
-        PXENVBD_REQUEST Request;
-
-        ListEntry = RemoveHeadList(&SrbExt->RequestList);
-        if (ListEntry == &SrbExt->RequestList)
-            break;
-        Request = CONTAINING_RECORD(ListEntry, XENVBD_REQUEST, ListEntry);
-        InsertTailList(&Target->Prepared, &Request->ListEntry);
-    }
-    KeReleaseSpinLock(&Target->QueueLock, Irql);
-
-    BlockRingKick(Target->BlockRing);
+    BlockRingSubmit(Target->BlockRing, &SrbExt->RequestList);
 }
 
 static FORCEINLINE VOID
@@ -2472,43 +2381,9 @@ TargetSuspendCallback(
     )
 {
     PXENVBD_TARGET      Target = Context;
-    PLIST_ENTRY         ListEntry;
-    PXENVBD_REQUEST     Request;
-    PXENVBD_SRBEXT      SrbExt;
-    PSCSI_REQUEST_BLOCK Srb;
     NTSTATUS            status;
 
-    // Any outstanding requests are going to cause problems...
-    // Submitted requests are lost
-    // Prepared requests will need re-preparing (different grant/backend)
-    for (;;) {
-        ListEntry = RemoveHeadList(&Target->Submitted);
-        if (ListEntry == &Target->Submitted)
-            break;
-        Request = CONTAINING_RECORD(ListEntry, XENVBD_REQUEST, ListEntry);
-        SrbExt = Request->SrbExt;
-        Srb = SrbExt->OriginalReq;
-
-        TargetPutRequest(Target, Request);
-        if (InterlockedDecrement(&SrbExt->RequestCount) == 0) {
-            Srb->SrbStatus = SRB_STATUS_ABORTED;
-            AdapterCompleteSrb(Target->Adapter, SrbExt);
-        }
-    }
-    for (;;) {
-        ListEntry = RemoveHeadList(&Target->Prepared);
-        if (ListEntry == &Target->Prepared)
-            break;
-        Request = CONTAINING_RECORD(ListEntry, XENVBD_REQUEST, ListEntry);
-        SrbExt = Request->SrbExt;
-        Srb = SrbExt->OriginalReq;
-
-        TargetPutRequest(Target, Request);
-        if (InterlockedDecrement(&SrbExt->RequestCount) == 0) {
-            Srb->SrbStatus = SRB_STATUS_ABORTED;
-            AdapterCompleteSrb(Target->Adapter, SrbExt);
-        }
-    }
+    BlockRingSuspendCallback(Target->BlockRing);
 
     __TargetD0ToD3(Target);
 
@@ -2992,8 +2867,6 @@ TargetCreate(
     if (!NT_SUCCESS(status))
         goto fail8;
 
-    InitializeListHead(&Target->Prepared);
-    InitializeListHead(&Target->Submitted);
     InitializeListHead(&Target->Shutdown);
 
     status = XENBUS_CACHE(Acquire,
@@ -3111,8 +2984,6 @@ fail10:
 fail9:
     Error("fail9\n");
 
-    RtlZeroMemory(&Target->Prepared, sizeof(LIST_ENTRY));
-    RtlZeroMemory(&Target->Submitted, sizeof(LIST_ENTRY));
     RtlZeroMemory(&Target->Shutdown, sizeof(LIST_ENTRY));
 
     ThreadAlert(Target->BackendThread);
@@ -3169,8 +3040,6 @@ TargetDestroy(
     IN  PXENVBD_TARGET  Target
     )
 {
-    ASSERT(IsListEmpty(&Target->Prepared));
-    ASSERT(IsListEmpty(&Target->Submitted));
     ASSERT(IsListEmpty(&Target->Shutdown));
 
     XENBUS_CACHE(Destroy,
@@ -3191,8 +3060,6 @@ TargetDestroy(
     XENBUS_CACHE(Release,
                  &Target->CacheInterface);
 
-    RtlZeroMemory(&Target->Prepared, sizeof(LIST_ENTRY));
-    RtlZeroMemory(&Target->Submitted, sizeof(LIST_ENTRY));
     RtlZeroMemory(&Target->Shutdown, sizeof(LIST_ENTRY));
 
     ThreadAlert(Target->BackendThread);

@@ -76,10 +76,15 @@ BlockRingDisconnect(
     IN  PXENVBD_BLOCKRING   BlockRing
     );
 
-extern BOOLEAN
+extern VOID
 BlockRingSubmit(
     IN  PXENVBD_BLOCKRING   BlockRing,
-    IN  PXENVBD_REQUEST     Request
+    IN  PLIST_ENTRY         RequestList
+    );
+
+extern VOID
+BlockRingSuspendCallback(
+    IN  PXENVBD_BLOCKRING   BlockRing
     );
 
 extern VOID
