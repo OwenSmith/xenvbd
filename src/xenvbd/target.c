@@ -900,18 +900,6 @@ TargetShutdown(
 }
 
 static FORCEINLINE VOID
-TargetQueueSrb(
-    IN  PXENVBD_TARGET  Target,
-    IN  PXENVBD_SRBEXT  SrbExt
-    )
-{
-    PSCSI_REQUEST_BLOCK Srb = SrbExt->OriginalReq;
-
-    Srb->SrbStatus = SRB_STATUS_PENDING;
-    BlockRingSubmit(Target->BlockRing, &SrbExt->RequestList);
-}
-
-static FORCEINLINE VOID
 TargetInquiryStd(
     IN  PXENVBD_TARGET  Target,
     IN  PXENVBD_SRBEXT  SrbExt
@@ -1374,7 +1362,7 @@ TargetStartSrb(
     case SCSIOP_UNMAP:
     case SCSIOP_SYNCHRONIZE_CACHE:
         ASSERT(Srb->SrbStatus == SRB_STATUS_PENDING);
-        TargetQueueSrb(Target, SrbExt);
+        BlockRingSubmit(Target->BlockRing, &SrbExt->RequestList);
         break;
 
     default:
