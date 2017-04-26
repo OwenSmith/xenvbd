@@ -213,6 +213,7 @@ TargetSetDevicePnpState(
     Target->PrevPnpState = Target->DevicePnpState;
     Target->DevicePnpState = State;
 }
+
 VOID
 TargetSetDeviceObject(
     IN  PXENVBD_TARGET  Target,
@@ -531,17 +532,17 @@ TargetPrepareRW(
     const ULONG         SectorSize = Target->SectorSize;
     const ULONG         SectorMask = SectorSize - 1;
     const ULONG         SectorsPerPage = PAGE_SIZE / SectorSize;
+    ULONG               MaxSegments;
+
+    MaxSegments = Target->FeatureIndirect;
+    MaxSegments = min(MaxSegments, XENVBD_MAX_SEGMENTS_PER_INDIRECT); // limit to sensible value
+    MaxSegments = max(MaxSegments, BLKIF_MAX_SEGMENTS_PER_REQUEST);   // ensure at least 11
+    ASSERT3U(MaxSegments, >=, BLKIF_MAX_SEGMENTS_PER_REQUEST);
+    ASSERT3U(MaxSegments, <=, XENVBD_MAX_SEGMENTS_PER_INDIRECT);
 
     while (SectorsLeft > 0) {
         PXENVBD_REQUEST Request;
         ULONG           Index;
-        ULONG           MaxSegments;
-
-        MaxSegments = Target->FeatureIndirect;
-        MaxSegments = min(MaxSegments, XENVBD_MAX_SEGMENTS_PER_INDIRECT); // limit to sensible value
-        MaxSegments = max(MaxSegments, BLKIF_MAX_SEGMENTS_PER_REQUEST);   // ensure at least 11
-        ASSERT3U(MaxSegments, >=, BLKIF_MAX_SEGMENTS_PER_REQUEST);
-        ASSERT3U(MaxSegments, <=, XENVBD_MAX_SEGMENTS_PER_INDIRECT);
 
         Request = TargetGetRequest(Target);
         if (Request == NULL) 
@@ -820,7 +821,7 @@ TargetCompleteRequest(
 
     TargetPutRequest(Target, Request);
 
-    if (InterlockedDecrement(&SrbExt->RequestCount) != 0)
+    if (InterlockedDecrement(&SrbExt->RequestCount) > 0)
         return;
 
     if (Srb->SrbStatus == SRB_STATUS_PENDING)
@@ -1025,6 +1026,8 @@ TargetInquiry(
 {
     PSCSI_REQUEST_BLOCK Srb = SrbExt->OriginalReq;
 
+    AdapterSetDeviceQueueDepth(Target->Adapter,
+                               Target->TargetId);
     if (Cdb_EVPD(Srb)) {
         switch (Cdb_PageCode(Srb)) {
         case 0x00:  TargetInquiry00(Target, SrbExt);    break;

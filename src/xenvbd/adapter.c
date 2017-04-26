@@ -58,7 +58,8 @@
 #include "debug.h"
 #include "assert.h"
 
-#define MAXNAMELEN  128
+#define XENVBD_MAX_QUEUE_DEPTH  (254)
+#define MAXNAMELEN              128
 #define ADAPTER_POOL_TAG        'adAX'
 
 struct _XENVBD_ADAPTER {
@@ -1538,6 +1539,20 @@ AdapterTargetListChanged(
                          Adapter,
                          NULL);
     Trace("<=====\n");
+}
+
+VOID
+AdapterSetDeviceQueueDepth(
+    IN  PXENVBD_ADAPTER     Adapter,
+    IN  ULONG               TargetId
+    )
+{
+    if (!StorPortSetDeviceQueueDepth(Adapter,
+                                     0,
+                                     (UCHAR)TargetId,
+                                     0,
+                                     XENVBD_MAX_QUEUE_DEPTH))
+        Verbose("[%u] : Failed to set queue depth\n", TargetId);
 }
 
 static FORCEINLINE VOID
