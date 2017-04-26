@@ -998,15 +998,19 @@ TargetInquiry83(
     PVPD_IDENTIFICATION_DESCRIPTOR  Descr;
 
     Srb->SrbStatus = SRB_STATUS_DATA_OVERRUN;
-    if (Srb->DataTransferLength < sizeof(VPD_IDENTIFICATION_PAGE) - 1 +
-                                  sizeof(VPD_IDENTIFICATION_DESCRIPTOR) + 16)
+    if (Srb->DataTransferLength < sizeof(VPD_IDENTIFICATION_PAGE) - 1)
         return;
 
     RtlZeroMemory(Data, Srb->DataTransferLength);
     Data->PageCode = 0x83;
-    Data->PageLength = sizeof(VPD_IDENTIFICATION_DESCRIPTOR) + 16;
+    Data->PageLength = 0;
 
-    Descr = (PVPD_IDENTIFICATION_DESCRIPTOR)Data->Descriptors;
+    // Try VpdIdentifierTypeVendorId:VpdCodeSetAscii (String Identifier)
+    if (Srb->DataTransferLength < sizeof(VPD_IDENTIFICATION_PAGE) - 1 +
+                                  sizeof(VPD_IDENTIFICATION_DESCRIPTOR) + 16)
+        goto done;
+
+    Descr = (PVPD_IDENTIFICATION_DESCRIPTOR)((PUCHAR)Data->Descriptors);
     Descr->CodeSet          = VpdCodeSetAscii;
     Descr->IdentifierType   = VpdIdentifierTypeVendorId;
     Descr->IdentifierLength = 16;
@@ -1015,9 +1019,13 @@ TargetInquiry83(
                        "XEN:%u:%u",
                        Target->DeviceId,
                        Target->TargetId);
+    Data->PageLength += sizeof(VPD_IDENTIFICATION_DESCRIPTOR) + Descr->IdentifierLength;
 
+    // Append other identifiers as required
+
+done:
     Srb->DataTransferLength = sizeof(VPD_IDENTIFICATION_PAGE) - 1 +
-                              sizeof(VPD_IDENTIFICATION_DESCRIPTOR) + 16;
+                              Data->PageLength;
     Srb->SrbStatus = SRB_STATUS_SUCCESS;
 }
 
@@ -1592,7 +1600,7 @@ TargetStoreReadFeatures(
                           &Target->StoreInterface,
                           NULL,
                           Target->BackendPath,
-                          "discard-secure",
+                          "discard-granularity",
                           &Buffer);
     if (NT_SUCCESS(status)) {
         Target->DiscardGranularity = strtoul(Buffer, NULL, 10);
