@@ -1768,6 +1768,8 @@ AdapterHwFindAdapter(
     PDEVICE_OBJECT                          DeviceObject;
     PDEVICE_OBJECT                          PhysicalDeviceObject;
     PDEVICE_OBJECT                          LowerDeviceObject;
+    ULONG                                   MaxTransferLength;
+    ULONG                                   MaxPhysicalBreaks;
     NTSTATUS                                status;
 
     UNREFERENCED_PARAMETER(Context);
@@ -1775,9 +1777,28 @@ AdapterHwFindAdapter(
     UNREFERENCED_PARAMETER(ArgumentString);
     UNREFERENCED_PARAMETER(Again);
 
+    // override settings
+    status = RegistryQueryDwordValue(DriverGetParametersKey(),
+                                     "MaxTransferLength",
+                                     &MaxTransferLength);
+    if (!NT_SUCCESS(status))
+        MaxTransferLength = XENVBD_MAX_TRANSFER_LENGTH;
+    if ((MaxTransferLength & (PAGE_SIZE - 1)) != 0)
+        MaxTransferLength = XENVBD_MAX_TRANSFER_LENGTH;
+
+    status = RegistryQueryDwordValue(DriverGetParametersKey(),
+                                     "MaxPhysicalBreaks",
+                                     &MaxPhysicalBreaks);
+    if (!NT_SUCCESS(status))
+        MaxPhysicalBreaks = XENVBD_MAX_PHYSICAL_BREAKS;
+
+    Verbose("MaxTransferLength: %u, MaxPhysicalBreaks: %u\n",
+            MaxTransferLength,
+            MaxPhysicalBreaks);
+
     // setup config info
-    ConfigInfo->MaximumTransferLength       = XENVBD_MAX_TRANSFER_LENGTH;
-    ConfigInfo->NumberOfPhysicalBreaks      = XENVBD_MAX_PHYSICAL_BREAKS;
+    ConfigInfo->MaximumTransferLength       = MaxTransferLength;
+    ConfigInfo->NumberOfPhysicalBreaks      = MaxPhysicalBreaks;
     ConfigInfo->AlignmentMask               = 0; // Byte-Aligned
     ConfigInfo->NumberOfBuses               = 1;
     ConfigInfo->InitiatorBusId[0]           = 1;

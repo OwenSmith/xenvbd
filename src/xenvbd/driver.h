@@ -35,9 +35,8 @@
 #include <ntddk.h>
 
 #define XENVBD_MAX_TARGETS              (255)
-#define XENVBD_MAX_PAGES_PER_SRB        (1024)
-#define XENVBD_MAX_TRANSFER_LENGTH      (XENVBD_MAX_PAGES_PER_SRB * PAGE_SIZE)
-#define XENVBD_MAX_PHYSICAL_BREAKS      (XENVBD_MAX_PAGES_PER_SRB - 1)
+#define XENVBD_MAX_TRANSFER_LENGTH      ((16 * 11) * PAGE_SIZE) // 1/2 ring of direct (or 1 indirect)
+#define XENVBD_MAX_PHYSICAL_BREAKS      ((16 * 11) - 1)         // 1/2 ring of direct (or 1 indirect)
 
 extern VOID
 DriverSetAdapter(
