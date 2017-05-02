@@ -662,8 +662,6 @@ TargetPrepareRW(
                     goto fail6;
 
                 InsertTailList(&Request->Indirects, &Indirect->ListEntry);
-
-                // TODO: Fill Indirect->Page with Segment info?
             }
         }
     }

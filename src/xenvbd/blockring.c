@@ -63,7 +63,7 @@ struct _XENVBD_BLOCKRING {
 
     PXENBUS_DEBUG_CALLBACK  DebugCallback;
 
-    LIST_ENTRY              Prepared;
+    LIST_ENTRY              Queued;
     LIST_ENTRY              Submitted;
 
     KSPIN_LOCK              Lock;
@@ -76,6 +76,7 @@ struct _XENVBD_BLOCKRING {
     PXENBUS_EVTCHN_CHANNEL  Channel;
     KDPC                    Dpc;
 
+    ULONG                   NrQueued;
     ULONG                   NrSubmitted;
     ULONG                   NrCompleted;
     ULONG                   NrInterrupts;
@@ -365,25 +366,25 @@ BlockRingPoll(
         BlockRing->Shared->rsp_event = rsp_cons + 1;
     }
 
-    // submit all prepared requests, prepare the next srb
+    // submit all queued requests
     for (;;) {
         PLIST_ENTRY     ListEntry;
         PXENVBD_REQUEST Request;
 
-        ListEntry = RemoveHeadList(&BlockRing->Prepared);
-        if (ListEntry == &BlockRing->Prepared)
+        ListEntry = RemoveHeadList(&BlockRing->Queued);
+        if (ListEntry == &BlockRing->Queued)
             break;
         Request = CONTAINING_RECORD(ListEntry, XENVBD_REQUEST, ListEntry);
 
         if (BlockRingPostRequest(BlockRing, Request))
             continue;
 
-        InsertHeadList(&BlockRing->Prepared, ListEntry);
+        InsertHeadList(&BlockRing->Queued, ListEntry);
         break;
     }
 
 done:
-    if (IsListEmpty(&BlockRing->Prepared) &&
+    if (IsListEmpty(&BlockRing->Queued) &&
         IsListEmpty(&BlockRing->Submitted))
         TargetCompleteShutdown(BlockRing->Target);
 
@@ -487,7 +488,8 @@ BlockRingDebugCallback(
 
     XENBUS_DEBUG(Printf,
                  &BlockRing->DebugInterface,
-                 "Submitted: %u, Completed: %u\n",
+                 "Queued: %u, Submitted: %u, Completed: %u\n",
+                 BlockRing->NrQueued,
                  BlockRing->NrSubmitted,
                  BlockRing->NrCompleted);
 
@@ -524,7 +526,7 @@ BlockRingCreate(
     (*BlockRing)->Target = Target;
     KeInitializeSpinLock(&(*BlockRing)->Lock);
     KeInitializeDpc(&(*BlockRing)->Dpc, BlockRingDpc, *BlockRing);
-    InitializeListHead(&(*BlockRing)->Prepared);
+    InitializeListHead(&(*BlockRing)->Queued);
     InitializeListHead(&(*BlockRing)->Submitted);
 
     return STATUS_SUCCESS;
@@ -541,7 +543,7 @@ BlockRingDestroy(
     BlockRing->Target = NULL;
     RtlZeroMemory(&BlockRing->Lock, sizeof(KSPIN_LOCK));
     RtlZeroMemory(&BlockRing->Dpc, sizeof(KDPC));
-    RtlZeroMemory(&BlockRing->Prepared, sizeof(LIST_ENTRY));
+    RtlZeroMemory(&BlockRing->Queued, sizeof(LIST_ENTRY));
     RtlZeroMemory(&BlockRing->Submitted, sizeof(LIST_ENTRY));
 
     ASSERT(IsZeroMemory(BlockRing, sizeof(XENVBD_BLOCKRING)));
@@ -845,6 +847,7 @@ BlockRingDisconnect(
     XENBUS_STORE(Release, &BlockRing->StoreInterface);
     RtlZeroMemory(&BlockRing->StoreInterface, sizeof(XENBUS_STORE_INTERFACE));
 
+    BlockRing->NrQueued = 0;
     BlockRing->NrSubmitted = 0;
     BlockRing->NrCompleted = 0;
     BlockRing->NrInterrupts = 0;
@@ -860,16 +863,16 @@ BlockRingSubmit(
     )
 {
     KIRQL                   Irql;
-    PLIST_ENTRY             ListItem;
+    PLIST_ENTRY             ListEntry;
 
     KeAcquireSpinLock(&BlockRing->Lock, &Irql);
 
-    ListItem = RequestList->Flink;
-
-    if (!IsListEmpty(RequestList)) {
-        RemoveEntryList(RequestList);
-        InitializeListHead(RequestList);
-        AppendTailList(&BlockRing->Prepared, ListItem);
+    for (;;) {
+        ListEntry = RemoveHeadList(RequestList);
+        if (ListEntry == RequestList)
+            break;
+        InsertTailList(&BlockRing->Queued, ListEntry);
+        ++BlockRing->NrQueued;
     }
 
     KeReleaseSpinLock(&BlockRing->Lock, Irql);
@@ -899,8 +902,8 @@ BlockRingSuspendCallback(
         PLIST_ENTRY         ListEntry;
         PXENVBD_REQUEST     Request;
 
-        ListEntry = RemoveHeadList(&BlockRing->Prepared);
-        if (ListEntry == &BlockRing->Prepared)
+        ListEntry = RemoveHeadList(&BlockRing->Queued);
+        if (ListEntry == &BlockRing->Queued)
             break;
         Request = CONTAINING_RECORD(ListEntry, XENVBD_REQUEST, ListEntry);
 
