@@ -79,6 +79,10 @@ struct _XENVBD_BLOCKRING {
     ULONG                   NrQueued;
     ULONG                   NrSubmitted;
     ULONG                   NrCompleted;
+    ULONG                   CurQueued;
+    ULONG                   CurSubmitted;
+    ULONG                   MaxQueued;
+    ULONG                   MaxSubmitted;
     ULONG                   NrInterrupts;
     ULONG                   NrDpcs;
 };
@@ -265,7 +269,11 @@ BlockRingPostRequest(
 
     req = RING_GET_REQUEST(&BlockRing->Front, BlockRing->Front.req_prod_pvt);
     ++BlockRing->Front.req_prod_pvt;
+    --BlockRing->CurQueued;
     ++BlockRing->NrSubmitted;
+    ++BlockRing->CurSubmitted;
+    if (BlockRing->CurSubmitted > BlockRing->MaxSubmitted)
+        BlockRing->MaxSubmitted = BlockRing->CurSubmitted;
     InsertTailList(&BlockRing->Submitted, &Request->ListEntry);
 
     BlockRingInsert(BlockRing, Request, req);
@@ -355,6 +363,7 @@ BlockRingPoll(
                                       rsp->status);
             }
             ++BlockRing->NrCompleted;
+            --BlockRing->CurSubmitted;
 
             // zero entire ring slot (to detect further failures)
             RtlZeroMemory(rsp, sizeof(union blkif_sring_entry));
@@ -390,7 +399,7 @@ done:
 
     KeReleaseSpinLockFromDpcLevel(&BlockRing->Lock);
 }
-
+ 
 KSERVICE_ROUTINE BlockRingInterrupt;
 
 BOOLEAN
@@ -492,6 +501,14 @@ BlockRingDebugCallback(
                  BlockRing->NrQueued,
                  BlockRing->NrSubmitted,
                  BlockRing->NrCompleted);
+
+    XENBUS_DEBUG(Printf,
+                 &BlockRing->DebugInterface,
+                 "Queued: %u / %u, Submitted: %u / %u\n",
+                 BlockRing->CurQueued,
+                 BlockRing->MaxQueued,
+                 BlockRing->CurSubmitted,
+                 BlockRing->MaxSubmitted);
 
     Port = XENBUS_EVTCHN(GetPort,
                          &BlockRing->EvtchnInterface,
@@ -847,9 +864,20 @@ BlockRingDisconnect(
     XENBUS_STORE(Release, &BlockRing->StoreInterface);
     RtlZeroMemory(&BlockRing->StoreInterface, sizeof(XENBUS_STORE_INTERFACE));
 
+    Verbose("Queued: %u / %u, Submitted %u / %u, Completed: %u\n",
+            BlockRing->NrQueued,
+            BlockRing->MaxQueued,
+            BlockRing->NrSubmitted,
+            BlockRing->MaxSubmitted,
+            BlockRing->NrCompleted);
+
     BlockRing->NrQueued = 0;
     BlockRing->NrSubmitted = 0;
     BlockRing->NrCompleted = 0;
+    BlockRing->CurQueued = 0;
+    BlockRing->CurSubmitted = 0;
+    BlockRing->MaxQueued = 0;
+    BlockRing->MaxSubmitted = 0;
     BlockRing->NrInterrupts = 0;
     BlockRing->NrDpcs = 0;
 
@@ -873,7 +901,10 @@ BlockRingSubmit(
             break;
         InsertTailList(&BlockRing->Queued, ListEntry);
         ++BlockRing->NrQueued;
+        ++BlockRing->CurQueued;
     }
+    if (BlockRing->CurQueued > BlockRing->MaxQueued)
+        BlockRing->MaxQueued = BlockRing->CurQueued;
 
     KeReleaseSpinLock(&BlockRing->Lock, Irql);
 

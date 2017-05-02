@@ -1853,7 +1853,36 @@ AdapterHwInitialize(
     IN  PVOID   DevExt
     )
 {
-    UNREFERENCED_PARAMETER(DevExt);
+    ULONG                   status;
+    PERF_CONFIGURATION_DATA Perf;
+
+    RtlZeroMemory(&Perf, sizeof(PERF_CONFIGURATION_DATA));
+    Perf.Version = STOR_PERF_VERSION;
+    Perf.Size  = sizeof(PERF_CONFIGURATION_DATA);
+
+    status = StorPortInitializePerfOpts(DevExt,
+                                        TRUE,
+                                        &Perf);
+    if (status != STOR_STATUS_SUCCESS)
+        return TRUE;
+
+    Verbose("Perf: %s%s%s%s%s%s\n",
+            Perf.Flags & STOR_PERF_DPC_REDIRECTION ? "DPC_REDIRECT " : "",
+            Perf.Flags & STOR_PERF_CONCURRENT_CHANNELS ? "CONCURRENT " : "",
+            Perf.Flags & STOR_PERF_INTERRUPT_MESSAGE_RANGES ? "MSG_RANGES " : "",
+            Perf.Flags & STOR_PERF_ADV_CONFIG_LOCALITY ? "LOCALITY " : "",
+            Perf.Flags & STOR_PERF_OPTIMIZE_FOR_COMPLETION_DURING_STARTIO ? "STARTIO " : "",
+            Perf.Flags & STOR_PERF_DPC_REDIRECTION_CURRENT_CPU ? "CURRENT_CPU " : "");
+    Verbose("Perf: %u Channels\n",
+            Perf.ConcurrentChannels);
+
+    if (Perf.Flags & STOR_PERF_CONCURRENT_CHANNELS)
+        Perf.ConcurrentChannels = KeQueryActiveProcessorCount(NULL);
+
+    status = StorPortInitializePerfOpts(DevExt,
+                                        FALSE,
+                                        &Perf);
+
     return TRUE;
 }
 
