@@ -50,6 +50,8 @@
 typedef struct _XENVBD_DRIVER {
     PXENVBD_ADAPTER     Adapter;
     HANDLE              ParametersKey;
+    ULONG               MaxTransferLength;
+    ULONG               MaxPhysicalBreaks;
     PDRIVER_DISPATCH    StorPortDispatchPnp;
     PDRIVER_DISPATCH    StorPortDispatchPower;
     PDRIVER_UNLOAD      StorPortDriverUnload;
@@ -83,6 +85,22 @@ DriverGetParametersKey(
     )
 {
     return __DriverGetParametersKey();
+}
+
+ULONG
+DriverGetMaxTransferLength(
+    VOID
+    )
+{
+    return Driver.MaxTransferLength;
+}
+
+ULONG
+DriverGetMaxPhysicalBreaks(
+    VOID
+    )
+{
+    return Driver.MaxPhysicalBreaks;
 }
 
 BOOLEAN
@@ -254,6 +272,9 @@ DriverUnload(
 
     BufferTerminate();
 
+    Driver.MaxTransferLength = 0;
+    Driver.MaxPhysicalBreaks = 0;
+
     RegistryCloseKey(Driver.ParametersKey);
     Driver.ParametersKey = NULL;
 
@@ -305,6 +326,26 @@ DriverEntry(
 
     Driver.ParametersKey = ParametersKey;
     Driver.Adapter = NULL;
+
+    // override settings
+    status = RegistryQueryDwordValue(ParametersKey,
+                                     "MaxTransferLength",
+                                     &Driver.MaxTransferLength);
+    if (!NT_SUCCESS(status))
+        Driver.MaxTransferLength = XENVBD_MAX_TRANSFER_LENGTH;
+    if ((Driver.MaxTransferLength & (PAGE_SIZE - 1)) != 0)
+        Driver.MaxTransferLength = XENVBD_MAX_TRANSFER_LENGTH;
+
+    status = RegistryQueryDwordValue(ParametersKey,
+                                     "MaxPhysicalBreaks",
+                                     &Driver.MaxPhysicalBreaks);
+    if (!NT_SUCCESS(status))
+        Driver.MaxPhysicalBreaks = XENVBD_MAX_PHYSICAL_BREAKS;
+
+    Verbose("MaxTransferLength: %u, MaxPhysicalBreaks: %u\n",
+            Driver.MaxTransferLength,
+            Driver.MaxPhysicalBreaks);
+
     BufferInitialize();
 
     status = AdapterDriverEntry(RegistryPath,
@@ -329,6 +370,9 @@ fail4:
     Error("fail4\n");
 
     BufferTerminate();
+
+    Driver.MaxTransferLength = 0;
+    Driver.MaxPhysicalBreaks = 0;
 
     RegistryCloseKey(Driver.ParametersKey);
     Driver.ParametersKey = NULL;

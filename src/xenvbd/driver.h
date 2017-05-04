@@ -48,6 +48,16 @@ DriverGetParametersKey(
     VOID
     );
 
+extern ULONG
+DriverGetMaxTransferLength(
+    VOID
+    );
+
+extern ULONG
+DriverGetMaxPhysicalBreaks(
+    VOID
+    );
+
 extern BOOLEAN
 DriverReadOverride(
     IN  PCHAR   Name
