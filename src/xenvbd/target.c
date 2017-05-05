@@ -1631,7 +1631,7 @@ TargetStoreReadFeatures(
             Target->FeatureIndirect ? " INDIRECT" : "");
 
     if (Target->FeatureDiscard)
-        Verbose("[%u] discard: %s%u @ %u\n",
+        Verbose("[%u] discard: %s%u from %u\n",
                 Target->TargetId,
                 Target->DiscardSecure ? "SECURE " : "",
                 Target->DiscardGranularity,
@@ -2438,10 +2438,10 @@ TargetDebugCallback(
     if (Target->FeatureDiscard) {
         XENBUS_DEBUG(Printf,
                     &Target->DebugInterface,
-                    "DISCARD: %s%u @ %u\n",
+                    "DISCARD: %s%u from %u\n",
                     Target->DiscardSecure ? "SECURE " : "",
-                    Target->DiscardAlignment,
-                    Target->DiscardGranularity);
+                    Target->DiscardGranularity,
+                    Target->DiscardAlignment);
     }
 
     if (Target->FeatureIndirect) {
