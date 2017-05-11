@@ -38,6 +38,8 @@
 #include <debug_interface.h>
 #include <evtchn_interface.h>
 
+#include "driver.h"
+#include "registry.h"
 #include "blockring.h"
 #include "target.h"
 #include "adapter.h"
@@ -606,8 +608,20 @@ BlockRingConnect(
                           "max-ring-page-order",
                           &Buffer);
     if (NT_SUCCESS(status)) {
+        ULONG               MaxRingPageOrder;
+
         BlockRing->Order = strtoul(Buffer, NULL, 10);
-        BlockRing->Order = min(BlockRing->Order, XENVBD_MAX_RING_PAGE_ORDER);
+
+        if (BlockRing->Order > XENVBD_MAX_RING_PAGE_ORDER)
+            BlockRing->Order = XENVBD_MAX_RING_PAGE_ORDER;
+
+        status = RegistryQueryDwordValue(DriverGetParametersKey(),
+                                         "MaxRingPageOrder",
+                                         &MaxRingPageOrder);
+        if (NT_SUCCESS(status)) {
+            if (BlockRing->Order > MaxRingPageOrder)
+                BlockRing->Order = MaxRingPageOrder;
+        }
 
         XENBUS_STORE(Free,
                      &BlockRing->StoreInterface, 
