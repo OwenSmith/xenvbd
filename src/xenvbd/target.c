@@ -35,7 +35,6 @@
 #include "frontend.h"
 #include "queue.h"
 #include "srbext.h"
-#include "buffer.h"
 #include "pdoinquiry.h"
 #include "debug.h"
 #include "assert.h"
@@ -446,11 +445,14 @@ TargetPutSegment(
     if (Segment->Grant)
         GranterPut(Granter, Segment->Grant);
 
-    if (Segment->BufferId)
-        BufferPut(Segment->BufferId);
+    if (Segment->Bounce) {
+        PXENVBD_BOUNCE  Bounce = Segment->Bounce;
 
-    if (Segment->Buffer)
-        MmUnmapLockedPages(Segment->Buffer, &Segment->Mdl);
+        if (Bounce->SourcePtr)
+            MmUnmapLockedPages(Bounce->SourcePtr, &Bounce->SourceMdl);
+
+        AdapterPutBounce(TargetGetAdapter(Target), Bounce);
+    }
 
     RtlZeroMemory(Segment, sizeof(XENVBD_SEGMENT));
     __LookasideFree(&Target->SegmentList, Segment);
@@ -631,8 +633,13 @@ RequestCopyOutput(
             Entry = Entry->Flink) {
         PXENVBD_SEGMENT Segment = CONTAINING_RECORD(Entry, XENVBD_SEGMENT, Entry);
 
-        if (Segment->BufferId)
-            BufferCopyOut(Segment->BufferId, Segment->Buffer, Segment->Length);
+        if (Segment->Bounce) {
+            PXENVBD_BOUNCE  Bounce = Segment->Bounce;
+
+            RtlCopyMemory(Bounce->SourcePtr,
+                          Bounce->BouncePtr,
+                          MmGetMdlByteCount(&Bounce->SourceMdl));
+        }
     }
 }
 
@@ -666,13 +673,12 @@ PrepareSegment(
         Segment->FirstSector    = (UCHAR)((Offset + SectorSize - 1) / SectorSize);
         *SectorsNow             = __min(SectorsLeft, SectorsPerPage - Segment->FirstSector);
         Segment->LastSector     = (UCHAR)(Segment->FirstSector + *SectorsNow - 1);
-        Segment->BufferId       = NULL; // granted, ensure its null
-        Segment->Buffer         = NULL; // granted, ensure its null
-        Segment->Length         = 0;    // granted, ensure its 0
+
 
         ASSERT3U((Length / SectorSize), ==, *SectorsNow);
     } else {
-        PMDL        Mdl;
+        PMDL            Mdl;
+        PXENVBD_BOUNCE  Bounce;
 
         ++Target->SegsBounced;
         // get first sector, last sector and count
@@ -680,10 +686,17 @@ PrepareSegment(
         *SectorsNow             = __min(SectorsLeft, SectorsPerPage);
         Segment->LastSector     = (UCHAR)(*SectorsNow - 1);
 
+        Bounce = AdapterGetBounce(TargetGetAdapter(Target));
+        if (Bounce == NULL) {
+            ++Target->FailedBounces;
+            goto fail1;
+        }
+        Segment->Bounce = Bounce;
+
         // map SGList to Virtual Address. Populates Segment->Buffer and Segment->Length
 #pragma warning(push)
 #pragma warning(disable:28145)
-        Mdl = &Segment->Mdl;
+        Mdl = &Bounce->SourceMdl;
         Mdl->Next           = NULL;
         Mdl->Size           = (SHORT)(sizeof(MDL) + sizeof(PFN_NUMBER));
         Mdl->MdlFlags       = MDL_PAGES_LOCKED;
@@ -692,7 +705,7 @@ PrepareSegment(
         Mdl->StartVa        = NULL;
         Mdl->ByteCount      = Length;
         Mdl->ByteOffset     = Offset;
-        Segment->Pfn[0]     = Pfn;
+        Bounce->SourcePfn[0] = Pfn;
 
         if (Length < *SectorsNow * SectorSize) {
             Pfn = AdapterGetNextSGEntry(TargetGetAdapter(Target),
@@ -702,7 +715,7 @@ PrepareSegment(
                                         &Length);
             Mdl->Size       += sizeof(PFN_NUMBER);
             Mdl->ByteCount  = Mdl->ByteCount + Length;
-            Segment->Pfn[1] = Pfn;
+            Bounce->SourcePfn[1] = Pfn;
         }
 #pragma warning(pop)
 
@@ -710,27 +723,28 @@ PrepareSegment(
         ASSERT3U(Mdl->ByteCount, <=, PAGE_SIZE);
         ASSERT3U(*SectorsNow, ==, (Mdl->ByteCount / SectorSize));
 
-        Segment->Length = __min(Mdl->ByteCount, PAGE_SIZE);
-        Segment->Buffer = MmMapLockedPagesSpecifyCache(Mdl, KernelMode,
-                                MmCached, NULL, FALSE, __TargetPriority(Target));
-        if (!Segment->Buffer) {
+        Bounce->SourcePtr = MmMapLockedPagesSpecifyCache(Mdl,
+                                                         KernelMode,
+                                                         MmCached,
+                                                         NULL,
+                                                         FALSE, 
+                                                         __TargetPriority(Target));
+        if (!Bounce->SourcePtr) {
             ++Target->FailedMaps;
-            goto fail1;
-        }
-
-        ASSERT3P(MmGetMdlPfnArray(Mdl)[0], ==, Segment->Pfn[0]);
-        ASSERT3P(MmGetMdlPfnArray(Mdl)[1], ==, Segment->Pfn[1]);
-
-        // get a buffer
-        if (!BufferGet(Segment, &Segment->BufferId, &Pfn)) {
-            ++Target->FailedBounces;
             goto fail2;
         }
 
+        ASSERT3P(MmGetMdlPfnArray(Mdl)[0], ==, Bounce->SourcePfn[0]);
+        ASSERT3P(MmGetMdlPfnArray(Mdl)[1], ==, Bounce->SourcePfn[1]);
+
         // copy contents in
         if (ReadOnly) { // Operation == BLKIF_OP_WRITE
-            BufferCopyIn(Segment->BufferId, Segment->Buffer, Segment->Length);
+            RtlCopyMemory(Bounce->BouncePtr,
+                          Bounce->SourcePtr,
+                          MmGetMdlByteCount(&Bounce->SourceMdl));
         }
+
+        Pfn = MmGetMdlPfnArray(Bounce->BounceMdl)[0];
     }
 
     // Grant segment's page

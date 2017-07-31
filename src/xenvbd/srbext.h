@@ -37,6 +37,14 @@
 #include <xen.h>
 #include "assert.h"
 
+typedef struct _XENVBD_BOUNCE {
+    PVOID       BouncePtr;
+    PMDL        BounceMdl;
+    PVOID       SourcePtr;
+    MDL         SourceMdl;
+    PFN_NUMBER  SourcePfn[2];
+} XENVBD_BOUNCE, *PXENVBD_BOUNCE;
+
 #pragma pack(push, 1)
 typedef struct _BLKIF_SEGMENT {
     ULONG                   GrantRef;
@@ -62,11 +70,7 @@ typedef struct _XENVBD_SEGMENT {
     PVOID                   Grant;
     UCHAR                   FirstSector;
     UCHAR                   LastSector;
-    ULONG                   Length;
-    PVOID                   BufferId;
-    PVOID                   Buffer; // VirtAddr mapped to PhysAddr(s)
-    MDL                     Mdl;
-    PFN_NUMBER              Pfn[2];
+    PXENVBD_BOUNCE          Bounce;
 } XENVBD_SEGMENT, *PXENVBD_SEGMENT;
 
 // Internal request context
