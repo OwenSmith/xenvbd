@@ -170,22 +170,18 @@ __FreePoolWithTag(
 }
 
 static FORCEINLINE PMDL
-__AllocatePages(
-    IN  ULONG           Count
+__AllocatePagesAt(
+    IN  SIZE_T              TotalBytes,
+    IN  PHYSICAL_ADDRESS    LowAddress
     )
 {
-    PHYSICAL_ADDRESS    LowAddress;
-    PHYSICAL_ADDRESS    HighAddress;
-    LARGE_INTEGER       SkipBytes;
-    SIZE_T              TotalBytes;
-    PMDL                Mdl;
-    PUCHAR              MdlMappedSystemVa;
-    NTSTATUS            status;
+    LARGE_INTEGER           SkipBytes;
+    PHYSICAL_ADDRESS        HighAddress;
+    PMDL                    Mdl;
+    PUCHAR                  MdlMappedSystemVa;
 
-    LowAddress.QuadPart = 0ull;
-    HighAddress.QuadPart = ~0ull;
     SkipBytes.QuadPart = 0ull;
-    TotalBytes = (SIZE_T)PAGE_SIZE * Count;
+    HighAddress.QuadPart = ~0ull;
 
     Mdl = MmAllocatePagesForMdlEx(LowAddress,
                                   HighAddress,
@@ -193,8 +189,6 @@ __AllocatePages(
                                   TotalBytes,
                                   MmCached,
                                   MM_DONT_ZERO_ALLOCATION);
-
-    status = STATUS_NO_MEMORY;
     if (Mdl == NULL)
         goto fail1;
 
@@ -215,7 +209,6 @@ __AllocatePages(
 						                             FALSE,
 						                             NormalPagePriority);
 
-    status = STATUS_UNSUCCESSFUL;
     if (MdlMappedSystemVa == NULL)
         goto fail3;
 
@@ -229,8 +222,42 @@ fail3:
 fail2:
     MmFreePagesFromMdl(Mdl);
     ExFreePool(Mdl);
-
 fail1:
+    return NULL;
+}
+
+static FORCEINLINE PMDL
+__AllocatePages(
+    IN  ULONG           Count
+    )
+{
+    SIZE_T              TotalBytes;
+    PHYSICAL_ADDRESS    LowAddress;
+    PMDL                Mdl;
+
+    TotalBytes = (SIZE_T)PAGE_SIZE * Count;
+
+    // Try above 4G
+    LowAddress.QuadPart = 0x100000000ull;
+    Mdl = __AllocatePagesAt(TotalBytes,
+                            LowAddress);
+    if (Mdl != NULL)
+        return Mdl;
+
+    // Try above 2G
+    LowAddress.QuadPart = 0x80000000ull;
+    Mdl = __AllocatePagesAt(TotalBytes,
+                            LowAddress);
+    if (Mdl != NULL)
+        return Mdl;
+
+    // Try anywhere
+    LowAddress.QuadPart = 0ull;
+    Mdl = __AllocatePagesAt(TotalBytes,
+                            LowAddress);
+    if (Mdl != NULL)
+        return Mdl;
+
     return NULL;
 }
 

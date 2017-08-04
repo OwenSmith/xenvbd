@@ -33,96 +33,64 @@
 #define _XENVBD_SRBEXT_H
 
 #include <ntddk.h>
-#include <xenvbd-storport.h>
-#include <xen.h>
-#include "assert.h"
+
+typedef struct _XENVBD_SRBEXT {
+    PVOID           Srb;
+    LIST_ENTRY      ListEntry;
+    LONG            RequestCount;
+    PVOID           SGList;
+    ULONG           SGIndex;
+    ULONG           SGOffset;
+} XENVBD_SRBEXT, *PXENVBD_SRBEXT;
 
 typedef struct _XENVBD_BOUNCE {
-    PVOID       BouncePtr;
-    PMDL        BounceMdl;
-    PVOID       SourcePtr;
-    MDL         SourceMdl;
-    PFN_NUMBER  SourcePfn[2];
+    PVOID           BouncePtr;
+    PMDL            BounceMdl;
+    PVOID           SourcePtr;
+    MDL             SourceMdl;
+    PFN_NUMBER      SourcePfn[2];
 } XENVBD_BOUNCE, *PXENVBD_BOUNCE;
 
 #pragma pack(push, 1)
 typedef struct _BLKIF_SEGMENT {
-    ULONG                   GrantRef;
-    UCHAR                   First;
-    UCHAR                   Last;
-    USHORT                  __Padding;
+    ULONG           GrantRef;
+    UCHAR           First;
+    UCHAR           Last;
+    USHORT          __Padding;
 } BLKIF_SEGMENT, *PBLKIF_SEGMENT;
 #pragma pack(pop)
 
-#define XENVBD_MAX_SEGMENTS_PER_PAGE    (PAGE_SIZE / sizeof(BLKIF_SEGMENT))
-
-// Internal indirect context
 typedef struct _XENVBD_INDIRECT {
-    LIST_ENTRY              Entry;
-    PBLKIF_SEGMENT          Page;
-    PVOID                   Grant;
-    PMDL                    Mdl;
+    LIST_ENTRY      ListEntry;
+    PMDL            Mdl;
+    PBLKIF_SEGMENT  Page;
+    PVOID           Grant;
 } XENVBD_INDIRECT, *PXENVBD_INDIRECT;
 
-// Internal segment context
 typedef struct _XENVBD_SEGMENT {
-    LIST_ENTRY              Entry;
-    PVOID                   Grant;
-    UCHAR                   FirstSector;
-    UCHAR                   LastSector;
-    PXENVBD_BOUNCE          Bounce;
+    LIST_ENTRY      ListEntry;
+    PVOID           Grant;
+    UCHAR           FirstSector;
+    UCHAR           LastSector;
+    PXENVBD_BOUNCE  Bounce;
 } XENVBD_SEGMENT, *PXENVBD_SEGMENT;
 
-// Internal request context
 typedef struct _XENVBD_REQUEST {
-    PSCSI_REQUEST_BLOCK     Srb;
-    LIST_ENTRY              Entry;
-    ULONG                   Id;
+    PXENVBD_SRBEXT  SrbExt;
+    LIST_ENTRY      ListEntry;
+    ULONG64         Id;
 
-    UCHAR                   Operation;  // BLKIF_OP_{READ/WRITE/BARRIER/DISCARD}
-    UCHAR                   Flags;      // BLKIF_OP_DISCARD only
-    USHORT                  NrSegments; // BLKIF_OP_{READ/WRITE} only, 0-11 (direct) or 11-4096 (indirect)
-    LIST_ENTRY              Segments;   // BLKIF_OP_{READ/WRITE} only
+    UCHAR           Operation;  // BLKIF_OP_{READ/WRITE/BARRIER/DISCARD}
+    UCHAR           Flags;      // BLKIF_OP_DISCARD only
+    USHORT          NrSegments; // BLKIF_OP_{READ/WRITE} only, 0-11 (direct) or 11-4096 (indirect)
+    LIST_ENTRY      Segments;   // BLKIF_OP_{READ/WRITE} only
 
-    ULONG64                 FirstSector;
-    ULONG64                 NrSectors;  // BLKIF_OP_DISCARD only
-    LIST_ENTRY              Indirects;  // BLKIF_OP_{READ/WRITE} with NrSegments > 11 only
+    ULONG64         FirstSector;
+    ULONG64         NrSectors;  // BLKIF_OP_DISCARD only
+    LIST_ENTRY      Indirects;  // BLKIF_OP_{READ/WRITE} with NrSegments > 11 only
 } XENVBD_REQUEST, *PXENVBD_REQUEST;
 
-// SRBExtension - context for SRBs
-typedef struct _XENVBD_SRBEXT {
-    PSCSI_REQUEST_BLOCK     Srb;
-    LIST_ENTRY              Entry;
-    LONG                    Count;
-
-    PVOID                   SGList;
-    ULONG                   SGIndex;
-    ULONG                   SGOffset;
-} XENVBD_SRBEXT, *PXENVBD_SRBEXT;
-
-FORCEINLINE PXENVBD_SRBEXT
-GetSrbExt(
-    __in PSCSI_REQUEST_BLOCK     Srb
-    )
-{
-    if (Srb && Srb->Function != SRB_FUNCTION_STORAGE_REQUEST_BLOCK) {
-        ASSERT3P(Srb->SrbExtension, !=, NULL);
-        return Srb->SrbExtension;
-    }
-    return NULL;
-}
-
-FORCEINLINE VOID
-InitSrbExt(
-    __in PSCSI_REQUEST_BLOCK    Srb
-    )
-{
-    PXENVBD_SRBEXT  SrbExt = GetSrbExt(Srb);
-    if (SrbExt) {
-        RtlZeroMemory(SrbExt, sizeof(XENVBD_SRBEXT));
-        SrbExt->Srb = Srb;
-    }
-    Srb->SrbStatus = SRB_STATUS_INVALID_REQUEST;
-}
+#define XENVBD_MAX_SEGMENTS_PER_PAGE        (PAGE_SIZE / sizeof(BLKIF_SEGMENT))
+#define XENVBD_MAX_SEGMENTS_PER_INDIRECT    (XENVBD_MAX_SEGMENTS_PER_PAGE * BLKIF_MAX_INDIRECT_PAGES_PER_REQUEST)
 
 #endif // _XENVBD_SRBEXT_H

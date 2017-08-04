@@ -32,6 +32,7 @@
 #ifndef XENCDB_H
 #define XENCDB_H
 
+#include <storport.h>
 #define XENCDB_SCSIOP_INVALID 0xFF
 
 FORCEINLINE USHORT Cdb_get_big_endian_word(const UCHAR src[2])

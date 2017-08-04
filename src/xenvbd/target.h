@@ -39,6 +39,39 @@ typedef struct _XENVBD_TARGET XENVBD_TARGET, *PXENVBD_TARGET;
 #include "adapter.h"
 #include "srbext.h"
 #include "types.h"
+#include "ring.h"
+
+#define TARGET_GET_PROPERTY(_name, _type)       \
+extern _type                                    \
+TargetGet ## _name ## (                         \
+    IN  PXENVBD_TARGET  Target                  \
+    );
+
+TARGET_GET_PROPERTY(Adapter, PXENVBD_ADAPTER)
+TARGET_GET_PROPERTY(Ring, PXENVBD_RING)
+TARGET_GET_PROPERTY(DeviceObject, PDEVICE_OBJECT)
+TARGET_GET_PROPERTY(DevicePnpState, DEVICE_PNP_STATE)
+TARGET_GET_PROPERTY(TargetId, ULONG)
+TARGET_GET_PROPERTY(DeviceId, ULONG)
+TARGET_GET_PROPERTY(Path, PCHAR)
+TARGET_GET_PROPERTY(TargetPath, PCHAR)
+TARGET_GET_PROPERTY(BackendPath, PCHAR)
+TARGET_GET_PROPERTY(BackendId, USHORT)
+TARGET_GET_PROPERTY(Missing, BOOLEAN)
+TARGET_GET_PROPERTY(SectorCount, ULONG64)
+TARGET_GET_PROPERTY(SectorSize, ULONG)
+TARGET_GET_PROPERTY(PhysicalSectorSize, ULONG)
+TARGET_GET_PROPERTY(FeatureRemovable, BOOLEAN)
+TARGET_GET_PROPERTY(SurpriseRemovable, BOOLEAN)
+TARGET_GET_PROPERTY(FeatureFlushCache, BOOLEAN)
+TARGET_GET_PROPERTY(FeatureBarrier, BOOLEAN)
+TARGET_GET_PROPERTY(FeatureDiscard, BOOLEAN)
+TARGET_GET_PROPERTY(FeatureDiscardSecure, BOOLEAN)
+TARGET_GET_PROPERTY(FeatureDiscardAlignment, ULONG)
+TARGET_GET_PROPERTY(FeatureDiscardGranularity, ULONG)
+TARGET_GET_PROPERTY(FeatureMaxIndirectSegments, ULONG)
+
+#undef TARGET_GET_PROPERTY
 
 extern NTSTATUS
 TargetCreate(
@@ -94,15 +127,9 @@ TargetSetDeviceObject(
     );
 
 extern VOID
-TargetSubmitRequests(
-    IN  PXENVBD_TARGET  Target
-    );
-
-extern VOID
-TargetCompleteResponse(
+TargetDisableFeature(
     IN  PXENVBD_TARGET  Target,
-    IN  ULONG           Tag,
-    IN  SHORT           Status
+    IN  UCHAR           Operation
     );
 
 extern VOID
@@ -134,21 +161,9 @@ TargetShutdown(
     IN  PXENVBD_SRBEXT  SrbExt
     );
 
-#define TARGET_GET_PROPERTY(_name, _type)       \
-extern _type                                    \
-TargetGet ## _name ## (                         \
-    IN  PXENVBD_TARGET  Target                  \
+extern VOID
+TargetCompleteShutdown(
+    IN  PXENVBD_TARGET      Target
     );
-
-TARGET_GET_PROPERTY(Adapter, PXENVBD_ADAPTER)
-TARGET_GET_PROPERTY(DeviceObject, PDEVICE_OBJECT)
-TARGET_GET_PROPERTY(TargetId, ULONG)
-TARGET_GET_PROPERTY(DeviceId, ULONG)
-TARGET_GET_PROPERTY(Removable, BOOLEAN)
-TARGET_GET_PROPERTY(SurpriseRemovable, BOOLEAN)
-TARGET_GET_PROPERTY(DevicePnpState, DEVICE_PNP_STATE)
-TARGET_GET_PROPERTY(Missing, BOOLEAN)
-
-#undef TARGET_GET_PROPERTY
 
 #endif // _XENVBD_TARGET_H

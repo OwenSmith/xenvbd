@@ -886,27 +886,27 @@ AdapterDebugCallback(
 
     XENBUS_DEBUG(Printf,
                  &Adapter->DebugInterface,
-                 "ADAPTER: Version: %u.%u.%u.%u (%02u/%02u/%04u)\n",
+                 "Version: %u.%u.%u.%u (%02u/%02u/%04u)\n",
                  MAJOR_VERSION, MINOR_VERSION, MICRO_VERSION, BUILD_NUMBER,
                  DAY, MONTH, YEAR);
     XENBUS_DEBUG(Printf,
                  &Adapter->DebugInterface,
-                 "ADAPTER: Adapter: 0x%p %s\n",
+                 "Adapter: 0x%p %s\n",
                  Context,
                  Crashing ? "CRASHING" : "");
     XENBUS_DEBUG(Printf,
                  &Adapter->DebugInterface,
-                 "ADAPTER: DevObj 0x%p LowerDevObj 0x%p PhysDevObj 0x%p\n",
+                 "DevObj 0x%p LowerDevObj 0x%p PhysDevObj 0x%p\n",
                  Adapter->DeviceObject,
                  Adapter->LowerDeviceObject,
                  Adapter->PhysicalDeviceObject);
     XENBUS_DEBUG(Printf,
                  &Adapter->DebugInterface,
-                 "ADAPTER: DevicePowerState: %s\n",
+                 "DevicePowerState: %s\n",
                  PowerDeviceStateName(Adapter->DevicePower));
     XENBUS_DEBUG(Printf,
                  &Adapter->DebugInterface,
-                 "ADAPTER: Srbs            : %u built, %u started, %u completed\n",
+                 "Srbs            : %u built, %u started, %u completed\n",
                  Adapter->BuildIo,
                  Adapter->StartIo,
                  Adapter->Completed);
@@ -994,7 +994,7 @@ AdapterD3ToD0(
 
     status = XENBUS_DEBUG(Register,
                           &Adapter->DebugInterface,
-                          __MODULE__,
+                          __MODULE__ "|ADAPTER",
                           AdapterDebugCallback,
                           Adapter,
                           &Adapter->DebugCallback);
@@ -1494,6 +1494,7 @@ AdapterCompleteSrb(
     PSCSI_REQUEST_BLOCK Srb = SrbExt->Srb;
 
     ASSERT3U(Srb->SrbStatus, !=, SRB_STATUS_PENDING);
+    ASSERT3U(SrbExt->RequestCount, ==, 0);
 
     InterlockedIncrement((PLONG)&Adapter->Completed);
 
@@ -1892,8 +1893,8 @@ __AdapterSrbPnp(
     case StorQueryCapabilities: {
         PSTOR_DEVICE_CAPABILITIES Caps = Srb->DataBuffer;
 
-        Caps->Removable = TargetGetRemovable(Target);
-        Caps->EjectSupported = TargetGetRemovable(Target);
+        Caps->Removable = TargetGetFeatureRemovable(Target);
+        Caps->EjectSupported = TargetGetFeatureRemovable(Target);
         Caps->SurpriseRemovalOK = TargetGetSurpriseRemovable(Target);
         Caps->UniqueID = 1;
 
@@ -1916,7 +1917,9 @@ AdapterHwBuildIo(
     PXENVBD_SRBEXT          SrbExt = Srb->SrbExtension;
     PXENVBD_TARGET          Target;
 
-    InitSrbExt(Srb);
+    RtlZeroMemory(SrbExt, sizeof(XENVBD_SRBEXT));
+    SrbExt->Srb = Srb;
+    InitializeListHead(&SrbExt->ListEntry);
 
     InterlockedIncrement((PLONG)&Adapter->BuildIo);
     switch (Srb->Function) {
