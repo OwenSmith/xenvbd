@@ -47,10 +47,13 @@
 #include "adapter.h"
 #include "srbext.h"
 #include "thread.h"
+#include "base64.h"
 
 #include "debug.h"
 #include "assert.h"
 #include "util.h"
+
+#define GUID_LENGTH (sizeof("xxxxxxxx-xxxx-xxxx-xxxxxxxxxxxx"))
 
 typedef enum _XENVBD_STATE {
     XENVBD_STATE_INVALID,
@@ -98,6 +101,11 @@ struct _XENVBD_TARGET {
     ULONG                       FeatureDiscardAlignment;
     ULONG                       FeatureDiscardGranularity;
     ULONG                       FeatureMaxIndirectSegments;
+    PVOID                       Page80;
+    ULONG                       Page80Length;
+    PVOID                       Page83;
+    ULONG                       Page83Length;
+    CHAR                        VdiUuid[GUID_LENGTH];
 
     LIST_ENTRY                  ShutdownSrbs;
     KSPIN_LOCK                  ShutdownLock;
@@ -704,12 +712,18 @@ __TargetInquiry00(
 
     UNREFERENCED_PARAMETER(Target);
 
+    if (Srb->DataTransferLength < sizeof(VPD_SUPPORTED_PAGES_PAGE) - 1 + 3) {
+        Srb->DataTransferLength = 0;
+        Srb->SrbStatus = SRB_STATUS_ERROR;
+        return;
+    }
+
     RtlZeroMemory(Data, Srb->DataTransferLength);
     Data->PageCode = 0x00;
     Data->PageLength = 3;
     Data->SupportedPageList[0] = 0x00;
     Data->SupportedPageList[1] = 0x80;
-    Data->SupportedPageList[2] = 0x81;
+    Data->SupportedPageList[2] = 0x83;
 
     Srb->DataTransferLength = sizeof(VPD_SUPPORTED_PAGES_PAGE) - 1 + 3;
     Srb->SrbStatus = SRB_STATUS_SUCCESS;
@@ -723,13 +737,34 @@ __TargetInquiry80(
 {
     PSCSI_REQUEST_BLOCK     Srb = SrbExt->Srb;
     PVPD_SERIAL_NUMBER_PAGE Data = Srb->DataBuffer;
+    ULONG                   Length;
 
     RtlZeroMemory(Data, Srb->DataTransferLength);
-    Data->PageCode      = 0x80;
-    Data->PageLength    = 4;
-    RtlStringCbPrintfA((PCHAR)Data->SerialNumber, 4, "%04u", __TargetGetTargetId(Target));
+    
+    if (Target->Page80 && Target->Page80Length) {
+        if (Srb->DataTransferLength < Target->Page80Length) {
+            Srb->DataTransferLength = 0;
+            Srb->SrbStatus = SRB_STATUS_ERROR;
+            return;
+        }
 
-    Srb->DataTransferLength = sizeof(VPD_SERIAL_NUMBER_PAGE) + 4;
+        RtlCopyMemory(Data,
+                      Target->Page80,
+                      Target->Page80Length);
+
+        Length = Target->Page80Length;
+    } else {
+        Data->PageCode      = 0x80;
+        Data->PageLength    = 4;
+        RtlStringCbPrintfA((PCHAR)Data->SerialNumber,
+                           4,
+                           "%04u",
+                           __TargetGetTargetId(Target));
+
+        Length = sizeof(VPD_SERIAL_NUMBER_PAGE) + 4;
+    }
+
+    Srb->DataTransferLength = Length;
     Srb->SrbStatus = SRB_STATUS_SUCCESS;
 }
 
@@ -741,20 +776,58 @@ __TargetInquiry83(
 {
     PSCSI_REQUEST_BLOCK         Srb = SrbExt->Srb;
     PVPD_IDENTIFICATION_PAGE    Data = Srb->DataBuffer;
+    ULONG                       Length;
     PVPD_IDENTIFICATION_DESCRIPTOR  Descr;
 
     RtlZeroMemory(Data, Srb->DataTransferLength);
-    Data->PageCode          = 0x83;
-    Data->PageLength        = 16;
-    Descr = (PVPD_IDENTIFICATION_DESCRIPTOR)Data->Descriptors;
-    Descr->CodeSet          = VpdCodeSetAscii;
-    Descr->IdentifierType   = VpdIdentifierTypeVendorId;
-    Descr->IdentifierLength = 16;
-    RtlStringCbPrintfA((PCHAR)Descr->Identifier, 16, "XENSRC  %08u", __TargetGetTargetId(Target));
 
-    Srb->DataTransferLength = sizeof(VPD_IDENTIFICATION_PAGE) - 1 +
-                              sizeof(VPD_IDENTIFICATION_DESCRIPTOR) - 1 +
-                              16;
+    if (Target->Page83 && Target->Page83Length) {
+        if (Srb->DataTransferLength < Target->Page83Length) {
+            Srb->DataTransferLength = 0;
+            Srb->SrbStatus = SRB_STATUS_ERROR;
+            return;
+        }
+
+        RtlCopyMemory(Data,
+                      Target->Page83,
+                      Target->Page83Length);
+
+        Length = Target->Page83Length;
+    } else {
+        Data->PageCode          = 0x83;
+        Data->PageLength        = 16;
+        Descr = (PVPD_IDENTIFICATION_DESCRIPTOR)Data->Descriptors;
+        Descr->CodeSet          = VpdCodeSetAscii;
+        Descr->IdentifierType   = VpdIdentifierTypeVendorId;
+        Descr->IdentifierLength = 16;
+        RtlStringCbPrintfA((PCHAR)Descr->Identifier,
+                           16,
+                           "XENSRC  %08u",
+                           __TargetGetTargetId(Target));
+
+        Length = sizeof(VPD_IDENTIFICATION_PAGE) - 1 +
+                 sizeof(VPD_IDENTIFICATION_DESCRIPTOR) - 1 +
+                 16;
+    }
+
+    // Append vdi-uuid descriptor (if buffer is large enough)
+    if (Srb->DataTransferLength >= Length + sizeof(VPD_IDENTIFICATION_DESCRIPTOR) - 1 + GUID_LENGTH) {
+        Data->PageLength += sizeof(VPD_IDENTIFICATION_DESCRIPTOR) - 1 + GUID_LENGTH;
+
+        Descr = (PVPD_IDENTIFICATION_DESCRIPTOR)((PUCHAR)Data + Length);
+        Descr->CodeSet          = VpdCodeSetAscii;
+        Descr->IdentifierType   = VpdIdentifierTypeVendorSpecific;
+        Descr->IdentifierLength = GUID_LENGTH;
+        RtlStringCbPrintfA((PCHAR)Descr->Identifier,
+                           GUID_LENGTH,
+                           "%s",
+                           Target->VdiUuid);
+
+        Length += sizeof(VPD_IDENTIFICATION_DESCRIPTOR) - 1 +
+                  GUID_LENGTH;
+    }
+
+    Srb->DataTransferLength = Length;
     Srb->SrbStatus = SRB_STATUS_SUCCESS;
 }
 
@@ -768,6 +841,12 @@ __TargetInquiryStd(
     PINQUIRYDATA        Data = Srb->DataBuffer;
 
     UNREFERENCED_PARAMETER(Target);
+
+    if (Srb->DataTransferLength < sizeof(INQUIRYDATA)) {
+        Srb->DataTransferLength = 0;
+        Srb->SrbStatus = SRB_STATUS_ERROR;
+        return;
+    }
 
     Data->DeviceType            = DIRECT_ACCESS_DEVICE;
     Data->DeviceTypeQualifier   = DEVICE_CONNECTED;
@@ -1338,6 +1417,17 @@ TargetReadParameters(
     return STATUS_SUCCESS;
 }
 
+static FORCEINLINE VOID
+TargetZeroParameters(
+    IN  PXENVBD_TARGET  Target
+    )
+{
+    Target->DiskInfo = 0;
+    Target->SectorSize = 0;
+    Target->PhysicalSectorSize = 0;
+    Target->SectorCount = 0;
+}
+
 static FORCEINLINE NTSTATUS
 TargetReadFeatures(
     IN  PXENVBD_TARGET  Target
@@ -1398,6 +1488,113 @@ TargetReadFeatures(
                 __TargetGetFeatureMaxIndirectSegments(Target));
 
     return STATUS_SUCCESS;
+}
+
+static FORCEINLINE VOID
+TargetZeroFeatures(
+    IN  PXENVBD_TARGET  Target
+    )
+{
+    Target->FeatureRemovable = FALSE;
+    Target->FeatureFlushCache = FALSE;
+    Target->FeatureBarrier = FALSE;
+    Target->FeatureDiscard = FALSE;
+    Target->FeatureDiscardEnable = FALSE;
+    Target->FeatureDiscardSecure = FALSE;
+    Target->FeatureDiscardAlignment = 0;
+    Target->FeatureDiscardGranularity = 0;
+    Target->FeatureMaxIndirectSegments = 0;
+}
+
+static FORCEINLINE VOID
+TargetReadInquiryOverrides(
+    IN  PXENVBD_TARGET  Target
+    )
+{
+    PCHAR               Buffer;
+    NTSTATUS            status;
+
+    status = XENBUS_STORE(Read,
+                          &Target->StoreInterface,
+                          NULL,
+                          __TargetGetBackendPath(Target),
+                          "sm-data/scsi/0x12/0x80",
+                          &Buffer);
+    if (NT_SUCCESS(status)) {
+        (VOID) Base64Decode(Buffer,
+                            &Target->Page80,
+                            &Target->Page80Length);
+
+        XENBUS_STORE(Free,
+                     &Target->StoreInterface,
+                     Buffer);
+    }
+
+    status = XENBUS_STORE(Read,
+                          &Target->StoreInterface,
+                          NULL,
+                          __TargetGetBackendPath(Target),
+                          "sm-data/scsi/0x12/0x83",
+                          &Buffer);
+    if (NT_SUCCESS(status)) {
+        (VOID) Base64Decode(Buffer,
+                            &Target->Page83,
+                            &Target->Page83Length);
+
+        XENBUS_STORE(Free,
+                     &Target->StoreInterface,
+                     Buffer);
+    }
+}
+
+static FORCEINLINE VOID
+TargetZeroInquiryOverrides(
+    IN  PXENVBD_TARGET  Target
+    )
+{
+    Base64Free(Target->Page80);
+    Target->Page80 = NULL;
+    Target->Page80Length = 0;
+
+    Base64Free(Target->Page83);
+    Target->Page83 = NULL;
+    Target->Page83Length = 0;
+}
+
+static FORCEINLINE VOID
+TargetReadVdiUuid(
+    IN  PXENVBD_TARGET  Target
+    )
+{
+    PCHAR               Buffer;
+    NTSTATUS            status;
+
+    status = XENBUS_STORE(Read,
+                          &Target->StoreInterface,
+                          NULL,
+                          __TargetGetBackendPath(Target),
+                          "sm-data/vdi-uuid",
+                          &Buffer);
+    if (NT_SUCCESS(status)) {
+        (VOID) RtlStringCchPrintfA(Target->VdiUuid,
+                                   GUID_LENGTH,
+                                   "%s",
+                                   Buffer);
+
+        Trace("VdiUuid = %s\n", Target->VdiUuid);
+
+        XENBUS_STORE(Free,
+                     &Target->StoreInterface,
+                     Buffer);
+    }
+}
+
+static FORCEINLINE VOID
+TargetZeroVdiUuid(
+    IN  PXENVBD_TARGET  Target
+    )
+{
+    RtlZeroMemory(Target->VdiUuid, sizeof(Target->VdiUuid));
 }
 
 static FORCEINLINE NTSTATUS
@@ -1857,6 +2054,9 @@ abort:
     if (!NT_SUCCESS(status))
         goto fail7;
 
+    TargetReadInquiryOverrides(Target);
+    TargetReadVdiUuid(Target);
+
     status = __TargetSetState(Target, XenbusStateConnected);
     if (!NT_SUCCESS(status))
         goto fail8;
@@ -1867,10 +2067,14 @@ abort:
 
 fail8:
     Error("fail8\n");
+    TargetZeroVdiUuid(Target);
+    TargetZeroInquiryOverrides(Target);
+    TargetZeroFeatures(Target);
 fail7:
     Error("fail7\n");
 fail6:
     Error("fail6\n");
+    TargetZeroParameters(Target);
 fail5:
     Error("fail5\n");
 fail4:
@@ -1879,6 +2083,7 @@ fail3:
     Error("fail3\n");
 fail2:
     Error("fail2\n");
+    RingDisconnect(Target->Ring);
 fail1:
     Error("fail1 %08x\n", status);
     return status;
@@ -1924,6 +2129,11 @@ TargetDisconnect(
     )
 {
     Trace("[%u] =====>\n", __TargetGetTargetId(Target));
+
+    TargetZeroVdiUuid(Target);
+    TargetZeroInquiryOverrides(Target);
+    TargetZeroFeatures(Target);
+    TargetZeroParameters(Target);
 
     RingDisconnect(Target->Ring);
 
